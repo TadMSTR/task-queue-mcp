@@ -2,7 +2,7 @@
 
 A [FastMCP](https://github.com/jlowin/fastmcp) server that exposes the agent orchestration task queue as an MCP tool interface. Agents submit tasks, check status, and record completions through typed, validated tools instead of raw YAML file writes.
 
-Runs as a Docker container on port 8485. Wired globally into `~/.claude/settings.json` so all Claude Code agent sessions have access.
+Runs as a Docker container on port 8485. Wired globally into `~/.claude.json` so all Claude Code agent sessions have access.
 
 ## Tools
 
