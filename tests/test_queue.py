@@ -337,3 +337,121 @@ def test_update_preserves_alert_state(tmp_path):
     updated = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
     assert updated["alert_state"]["alert_count"] == 3
     assert updated["retry_policy"]["retry_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 additive tests
+# ---------------------------------------------------------------------------
+
+def test_submit_empty_source_agent_rejected(tmp_path):
+    result = submit_task_handler(
+        source_agent="",
+        target_agent="dev",
+        task_type="build",
+        summary="s",
+        description="d",
+        queue_dir=str(tmp_path),
+    )
+    assert result["ok"] is False
+    assert "source_agent" in result["error"]
+
+
+def test_submit_blank_target_agent_rejected(tmp_path):
+    result = submit_task_handler(
+        source_agent="dev",
+        target_agent="   ",
+        task_type="build",
+        summary="s",
+        description="d",
+        queue_dir=str(tmp_path),
+    )
+    assert result["ok"] is False
+    assert "target_agent" in result["error"]
+
+
+def test_submit_invalid_task_type_rejected(tmp_path):
+    result = submit_task_handler(
+        source_agent="dev",
+        target_agent="dev",
+        task_type="unknown_type",
+        summary="s",
+        description="d",
+        queue_dir=str(tmp_path),
+    )
+    assert result["ok"] is False
+    assert "task_type" in result["error"]
+
+
+def test_submit_all_valid_task_types_accepted(tmp_path):
+    from src.tools.queue import VALID_TASK_TYPES
+    for t in VALID_TASK_TYPES:
+        result = submit_task_handler(
+            source_agent="dev",
+            target_agent="dev",
+            task_type=t,
+            summary="s",
+            description="d",
+            queue_dir=str(tmp_path),
+        )
+        assert result["ok"] is True, f"task_type={t!r} should be valid"
+
+
+def test_update_archived_task_returns_error(tmp_path):
+    result = make_task(tmp_path)
+    task_id = result["task_id"]
+
+    # Move task file to archive
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    src = tmp_path / result["filename"]
+    dst = archive_dir / result["filename"]
+    src.rename(dst)
+
+    update_result = update_task_handler(
+        task_id=task_id,
+        status="in-progress",
+        actor="dev",
+        queue_dir=str(tmp_path),
+    )
+    assert update_result["ok"] is False
+    assert "archived" in update_result["error"]
+
+
+def test_update_output_none_preserved(tmp_path):
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "in-progress")
+
+    update_task_handler(
+        task_id=result["task_id"],
+        status="completed",
+        actor="dev",
+        output=None,
+        queue_dir=str(tmp_path),
+    )
+
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["result"]["output"] is None
+
+
+def test_ttl_boundary_zero_rejected(tmp_path):
+    result = submit_task_handler(
+        source_agent="dev", target_agent="dev", task_type="build",
+        summary="s", description="d", ttl_days=0, queue_dir=str(tmp_path),
+    )
+    assert result["ok"] is False
+
+
+def test_ttl_boundary_negative_rejected(tmp_path):
+    result = submit_task_handler(
+        source_agent="dev", target_agent="dev", task_type="build",
+        summary="s", description="d", ttl_days=-1, queue_dir=str(tmp_path),
+    )
+    assert result["ok"] is False
+
+
+def test_ttl_boundary_one_accepted(tmp_path):
+    result = submit_task_handler(
+        source_agent="dev", target_agent="dev", task_type="build",
+        summary="s", description="d", ttl_days=1, queue_dir=str(tmp_path),
+    )
+    assert result["ok"] is True
