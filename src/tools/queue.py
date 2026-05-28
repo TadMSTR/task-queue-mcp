@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 VALID_RISK_LEVELS = {"low", "medium", "high"}
 VALID_STATUSES = {"submitted", "approved", "pending-approval", "in-progress", "completed", "failed"}
 VALID_PRIORITIES = {"normal", "high", "urgent"}
+VALID_TASK_TYPES = {"build", "deploy", "fix", "research", "review", "audit", "notify"}
 TERMINAL_STATUSES = {"completed", "failed"}
 
 # Valid source statuses for each target transition in update_task
@@ -129,6 +130,14 @@ def submit_task_handler(
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
 
+    if not source_agent or not source_agent.strip():
+        return {"ok": False, "error": "source_agent must not be empty"}
+    if not target_agent or not target_agent.strip():
+        return {"ok": False, "error": "target_agent must not be empty"}
+    if not summary or not summary.strip():
+        return {"ok": False, "error": "summary must not be empty"}
+    if task_type not in VALID_TASK_TYPES:
+        return {"ok": False, "error": f"Invalid task_type: {task_type!r}. Must be one of: {sorted(VALID_TASK_TYPES)}"}
     if risk_level not in VALID_RISK_LEVELS:
         return {"ok": False, "error": f"Invalid risk_level: {risk_level!r}. Must be one of: {sorted(VALID_RISK_LEVELS)}"}
     if priority not in VALID_PRIORITIES:
@@ -283,11 +292,14 @@ def update_task_handler(
         return {"ok": False, "error": f"Invalid status: {status!r}. update_task accepts: {sorted(valid_update_statuses)}"}
 
     with _task_lock(queue_dir, task_id):
-        tasks = _load_all_tasks(queue_dir, include_archived=False)
+        tasks = _load_all_tasks(queue_dir, include_archived=True)
         task = next((t for t in tasks if t.get("id") == task_id), None)
 
         if task is None:
             return {"ok": False, "error": "not found"}
+
+        if "archive" in task.get("_path", ""):
+            return {"ok": False, "error": "task is archived and cannot be updated"}
 
         current_status = task.get("status")
 
