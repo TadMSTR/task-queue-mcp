@@ -338,4 +338,5 @@ def update_task_handler(
         path = task.pop("_path")
         _write_task_atomic(path, task)
 
+    logger.info("task.transition id=%s %s→%s actor=%s", task_id[:8], current_status, status, actor)
     return {"ok": True, "task_id": task_id}
