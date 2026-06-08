@@ -15,6 +15,7 @@ VALID_RISK_LEVELS = {"low", "medium", "high"}
 VALID_STATUSES = {"submitted", "approved", "pending-approval", "in-progress", "completed", "failed"}
 VALID_PRIORITIES = {"normal", "high", "urgent"}
 VALID_TASK_TYPES = {"build", "deploy", "fix", "research", "review", "audit", "notify"}
+VALID_WORKFLOW_MODES = {"semi-auto", "auto"}
 TERMINAL_STATUSES = {"completed", "failed"}
 
 # Valid source statuses for each target transition in update_task
@@ -123,6 +124,7 @@ def submit_task_handler(
     priority: str = "normal",
     context_refs: list = None,
     ttl_days: int = 30,
+    workflow_mode: str = "semi-auto",
     queue_dir: str = None,
 ) -> dict:
     if context_refs is None:
@@ -142,6 +144,8 @@ def submit_task_handler(
         return {"ok": False, "error": f"Invalid risk_level: {risk_level!r}. Must be one of: {sorted(VALID_RISK_LEVELS)}"}
     if priority not in VALID_PRIORITIES:
         return {"ok": False, "error": f"Invalid priority: {priority!r}. Must be one of: {sorted(VALID_PRIORITIES)}"}
+    if workflow_mode not in VALID_WORKFLOW_MODES:
+        return {"ok": False, "error": f"Invalid workflow_mode: {workflow_mode!r}. Must be one of: {sorted(VALID_WORKFLOW_MODES)}"}
     if not isinstance(ttl_days, int) or ttl_days < 1:
         return {"ok": False, "error": f"Invalid ttl_days: {ttl_days!r}. Must be a positive integer."}
 
@@ -164,6 +168,7 @@ def submit_task_handler(
         "task_type": task_type,
         "risk_level": risk_level,
         "requires_approval": requires_approval,
+        "workflow_mode": workflow_mode,
         "status": "submitted",
         "summary": summary,
         "ttl_days": ttl_days,
