@@ -181,6 +181,17 @@ def test_get_task_returns_workflow_mode(tmp_path):
     assert task["workflow_mode"] == "auto"
 
 
+def test_list_tasks_returns_workflow_mode(tmp_path):
+    submit_task_handler(
+        source_agent="a", target_agent="b", task_type="build",
+        summary="s", description="d", workflow_mode="auto",
+        queue_dir=str(tmp_path),
+    )
+    results = list_tasks_handler(queue_dir=str(tmp_path))
+    assert len(results) == 1
+    assert results[0]["workflow_mode"] == "auto"
+
+
 # ---------------------------------------------------------------------------
 # list_tasks tests
 # ---------------------------------------------------------------------------
