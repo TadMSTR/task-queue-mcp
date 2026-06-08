@@ -50,11 +50,13 @@ def submit_task(
     priority: str = "normal",
     context_refs: list[str] = None,
     ttl_days: int = 30,
+    workflow_mode: str = "semi-auto",
 ) -> dict:
     """
     Submit a new task to the queue.
     risk_level: low | medium | high
     priority: normal | high | urgent
+    workflow_mode: semi-auto | auto
     context_refs: list of absolute paths relevant to this task
     Returns: {ok, task_id, filename} on success or {ok: false, error} on failure.
     """
@@ -69,6 +71,7 @@ def submit_task(
         priority=priority,
         context_refs=context_refs or [],
         ttl_days=ttl_days,
+        workflow_mode=workflow_mode,
         queue_dir=QUEUE_DIR,
     )
 

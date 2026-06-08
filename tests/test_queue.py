@@ -137,6 +137,50 @@ def test_submit_valid_context_ref(tmp_path):
     assert result["ok"] is True
 
 
+def test_submit_invalid_workflow_mode(tmp_path):
+    result = submit_task_handler(
+        source_agent="a", target_agent="b", task_type="build",
+        summary="s", description="d", workflow_mode="manual",
+        queue_dir=str(tmp_path),
+    )
+    assert result["ok"] is False
+    assert "workflow_mode" in result["error"]
+
+
+def test_submit_workflow_mode_default_semi_auto(tmp_path):
+    result = make_task(tmp_path)
+    assert result["ok"] is True
+
+    with open(tmp_path / result["filename"]) as f:
+        data = yaml.safe_load(f)
+
+    assert data["workflow_mode"] == "semi-auto"
+
+
+def test_submit_workflow_mode_auto(tmp_path):
+    result = submit_task_handler(
+        source_agent="a", target_agent="b", task_type="build",
+        summary="s", description="d", workflow_mode="auto",
+        queue_dir=str(tmp_path),
+    )
+    assert result["ok"] is True
+
+    with open(tmp_path / result["filename"]) as f:
+        data = yaml.safe_load(f)
+
+    assert data["workflow_mode"] == "auto"
+
+
+def test_get_task_returns_workflow_mode(tmp_path):
+    submit_result = submit_task_handler(
+        source_agent="a", target_agent="b", task_type="build",
+        summary="s", description="d", workflow_mode="auto",
+        queue_dir=str(tmp_path),
+    )
+    task = get_task_handler(task_id=submit_result["task_id"], queue_dir=str(tmp_path))
+    assert task["workflow_mode"] == "auto"
+
+
 # ---------------------------------------------------------------------------
 # list_tasks tests
 # ---------------------------------------------------------------------------
