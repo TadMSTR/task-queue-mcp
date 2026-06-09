@@ -27,11 +27,12 @@ submit_task(
     priority="normal",              # normal | high | urgent (default: normal)
     context_refs=["/home/ted/.claude/projects/research/build-plans/qmd/plan.md"],
     ttl_days=30,
+    workflow_mode="semi-auto",          # semi-auto | auto (default: semi-auto)
 )
 # → {"ok": true, "task_id": "<uuid>", "filename": "<timestamp>-<slug>.yml"}
 ```
 
-`context_refs` must be absolute paths. `risk_level` and `priority` are validated against allowlists. The server generates the UUID, sets `created`, and initializes `alert_state` and `retry_policy` stubs.
+`context_refs` must be absolute paths. `risk_level` and `priority` are validated against allowlists. `workflow_mode` controls dispatcher behavior: `semi-auto` (default) queues the task for operator pickup with a Matrix notification, while `auto` triggers the dispatcher to launch the target agent headlessly. The server generates the UUID, sets `created`, and initializes `alert_state` and `retry_policy` stubs.
 
 ### list_tasks
 
