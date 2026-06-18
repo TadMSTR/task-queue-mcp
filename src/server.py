@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastmcp import FastMCP
 
@@ -51,6 +52,7 @@ def submit_task(
     context_refs: list[str] = None,
     ttl_days: int = 30,
     workflow_mode: str = "semi-auto",
+    originating_task_id: Optional[str] = None,
 ) -> dict:
     """
     Submit a new task to the queue.
@@ -58,6 +60,7 @@ def submit_task(
     priority: normal | high | urgent
     workflow_mode: semi-auto | auto
     context_refs: list of absolute paths relevant to this task
+    originating_task_id: UUID of the parent task; dispatcher inherits its workflow_mode
     Returns: {ok, task_id, filename} on success or {ok: false, error} on failure.
     """
     return submit_task_handler(
@@ -72,6 +75,7 @@ def submit_task(
         context_refs=context_refs or [],
         ttl_days=ttl_days,
         workflow_mode=workflow_mode,
+        originating_task_id=originating_task_id,
         queue_dir=QUEUE_DIR,
     )
 
