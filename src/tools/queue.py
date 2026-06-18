@@ -125,6 +125,7 @@ def submit_task_handler(
     context_refs: list = None,
     ttl_days: int = 30,
     workflow_mode: str = "semi-auto",
+    originating_task_id: Optional[str] = None,
     queue_dir: str = None,
 ) -> dict:
     if context_refs is None:
@@ -148,6 +149,11 @@ def submit_task_handler(
         return {"ok": False, "error": f"Invalid workflow_mode: {workflow_mode!r}. Must be one of: {sorted(VALID_WORKFLOW_MODES)}"}
     if not isinstance(ttl_days, int) or ttl_days < 1:
         return {"ok": False, "error": f"Invalid ttl_days: {ttl_days!r}. Must be a positive integer."}
+    if originating_task_id is not None:
+        try:
+            uuid.UUID(originating_task_id)
+        except ValueError:
+            return {"ok": False, "error": f"Invalid originating_task_id: {originating_task_id!r} — must be a UUID"}
 
     if context_refs:
         err = _validate_context_refs(context_refs)
@@ -159,6 +165,14 @@ def submit_task_handler(
     slug = task_id[:8]
     filename = f"{now.strftime('%Y%m%d-%H%M%S')}-{slug}.yml"
     path = os.path.join(queue_dir, filename)
+
+    payload: dict = {
+        "description": description,
+        "context_refs": context_refs,
+        "priority": priority,
+    }
+    if originating_task_id is not None:
+        payload["originating_task_id"] = originating_task_id
 
     task = {
         "id": task_id,
@@ -172,11 +186,7 @@ def submit_task_handler(
         "status": "submitted",
         "summary": summary,
         "ttl_days": ttl_days,
-        "payload": {
-            "description": description,
-            "context_refs": context_refs,
-            "priority": priority,
-        },
+        "payload": payload,
         "result": {
             "output": None,
             "completed_by": None,

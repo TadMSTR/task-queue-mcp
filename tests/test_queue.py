@@ -510,3 +510,42 @@ def test_ttl_boundary_one_accepted(tmp_path):
         summary="s", description="d", ttl_days=1, queue_dir=str(tmp_path),
     )
     assert result["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# originating_task_id tests
+# ---------------------------------------------------------------------------
+
+def test_submit_originating_task_id_stored(tmp_path):
+    parent_id = str(uuid.uuid4())
+    result = submit_task_handler(
+        source_agent="security", target_agent="developer", task_type="build",
+        summary="s", description="d", originating_task_id=parent_id,
+        queue_dir=str(tmp_path),
+    )
+    assert result["ok"] is True
+
+    with open(tmp_path / result["filename"]) as f:
+        data = yaml.safe_load(f)
+
+    assert data["payload"]["originating_task_id"] == parent_id
+
+
+def test_submit_originating_task_id_none_omitted(tmp_path):
+    result = make_task(tmp_path)
+    assert result["ok"] is True
+
+    with open(tmp_path / result["filename"]) as f:
+        data = yaml.safe_load(f)
+
+    assert "originating_task_id" not in data["payload"]
+
+
+def test_submit_originating_task_id_invalid_uuid_rejected(tmp_path):
+    result = submit_task_handler(
+        source_agent="dev", target_agent="dev", task_type="build",
+        summary="s", description="d", originating_task_id="not-a-uuid",
+        queue_dir=str(tmp_path),
+    )
+    assert result["ok"] is False
+    assert "originating_task_id" in result["error"]
