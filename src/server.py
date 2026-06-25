@@ -1,15 +1,22 @@
+import hmac
+import json
+import logging
 import os
 import sys
-import logging
 from contextlib import asynccontextmanager
-from typing import Optional
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from src.tools.queue import (
-    submit_task_handler,
-    list_tasks_handler,
+    cancel_task_handler,
     get_task_handler,
+    list_tasks_handler,
+    quarantine_task_handler,
+    restore_task_handler,
+    set_task_status_handler,
+    submit_task_handler,
     update_task_handler,
 )
 
@@ -49,10 +56,10 @@ def submit_task(
     risk_level: str = "low",
     requires_approval: bool = False,
     priority: str = "normal",
-    context_refs: list[str] = None,
+    context_refs: list[str] | None = None,
     ttl_days: int = 30,
     workflow_mode: str = "semi-auto",
-    originating_task_id: Optional[str] = None,
+    originating_task_id: str | None = None,
 ) -> dict:
     """
     Submit a new task to the queue.
@@ -82,10 +89,10 @@ def submit_task(
 
 @mcp.tool()
 def list_tasks(
-    target_agent: str = None,
-    source_agent: str = None,
-    status: str = None,
-    task_type: str = None,
+    target_agent: str | None = None,
+    source_agent: str | None = None,
+    status: str | None = None,
+    task_type: str | None = None,
     include_archived: bool = False,
     limit: int = 20,
 ) -> list:
@@ -120,7 +127,7 @@ def update_task(
     status: str,
     actor: str,
     note: str = "",
-    output: str = None,
+    output: str | None = None,
 ) -> dict:
     """
     Update task status and append a history entry.
@@ -136,6 +143,186 @@ def update_task(
         output=output,
         queue_dir=QUEUE_DIR,
     )
+
+
+@mcp.tool()
+def set_task_status(
+    task_id: str,
+    status: str,
+    actor: str,
+    note: str = "",
+    allow_override: bool = False,
+) -> dict:
+    """
+    Operator status change (broader than update_task). Standard transitions:
+    submitted/pending-approval→approved, any non-terminal→cancelled. Set
+    allow_override=True (with a non-empty note) to advance a missed task between any
+    two non-terminal statuses. Terminal tasks are immutable. Returns {ok, task_id}.
+    """
+    return set_task_status_handler(
+        task_id=task_id,
+        status=status,
+        actor=actor,
+        note=note,
+        allow_override=allow_override,
+        queue_dir=QUEUE_DIR,
+    )
+
+
+@mcp.tool()
+def cancel_task(task_id: str, actor: str, note: str = "") -> dict:
+    """
+    Cancel a task — a graceful, audited terminal state for stale or unwanted tasks
+    (use instead of mislabeling them `failed`). The record stays on disk. Returns
+    {ok, task_id} or {ok: false, error}.
+    """
+    return cancel_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
+
+
+@mcp.tool()
+def quarantine_task(task_id: str, actor: str, note: str = "") -> dict:
+    """
+    Isolate a task by moving its YAML to quarantine/ (recoverable, not deleted). It drops
+    out of list_tasks but stays resolvable via get_task and restorable via restore_task.
+    Returns {ok, task_id} or {ok: false, error}.
+    """
+    return quarantine_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
+
+
+@mcp.tool()
+def restore_task(task_id: str, actor: str, note: str = "") -> dict:
+    """
+    Restore a quarantined task back to the active queue. Reverses quarantine_task.
+    Returns {ok, task_id} or {ok: false, error}.
+    """
+    return restore_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
+
+
+# ---------------------------------------------------------------------------
+# HTTP control API — the single validated mutation path for non-MCP clients
+# (the CloudCLI plugin and the Matrix bot). Mounted as custom routes on the
+# existing FastMCP HTTP app, so it shares this container and port 8485.
+#
+# These routes are NOT behind the MCP auth middleware, so the shared secret is
+# the only gate (defense-in-depth on top of the loopback-published port). Every
+# route delegates to the same handlers as the MCP tools, inheriting transition
+# validation + fcntl locking + atomic writes. Reads stay direct in the clients.
+# ---------------------------------------------------------------------------
+
+SECRET_HEADER = "X-Task-Queue-Secret"
+
+
+def _authorized(request: Request) -> bool:
+    """Constant-time shared-secret check. Fails closed when no secret is configured."""
+    secret = os.environ.get("TASK_QUEUE_API_SECRET", "")
+    if not secret:
+        logger.warning("TASK_QUEUE_API_SECRET not configured — rejecting control-API request")
+        return False
+    provided = request.headers.get(SECRET_HEADER, "")
+    # Compare as bytes — hmac.compare_digest raises TypeError on str operands with
+    # non-ASCII chars, so a malformed header must not escape as a 500. (audit L-02)
+    return hmac.compare_digest(provided.encode("utf-8"), secret.encode("utf-8"))
+
+
+async def _json_body(request: Request) -> dict:
+    """Parse a JSON request body, tolerating an empty body. Returns {} on empty/invalid."""
+    raw = await request.body()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _status_for(result: dict) -> int:
+    if result.get("ok"):
+        return 200
+    if result.get("error") == "not found":
+        return 404
+    return 400
+
+
+def _control_response(result: dict) -> JSONResponse:
+    return JSONResponse(result, status_code=_status_for(result))
+
+
+def _unauthorized() -> JSONResponse:
+    return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+
+@mcp.custom_route("/tasks/{task_id}/approve", methods=["POST"])
+async def http_approve(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = set_task_status_handler(
+        task_id=request.path_params["task_id"],
+        status="approved",
+        actor=body.get("actor", "operator"),
+        note=body.get("note", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
+@mcp.custom_route("/tasks/{task_id}/cancel", methods=["POST"])
+async def http_cancel(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = cancel_task_handler(
+        task_id=request.path_params["task_id"],
+        actor=body.get("actor", "operator"),
+        note=body.get("note", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
+@mcp.custom_route("/tasks/{task_id}/status", methods=["POST"])
+async def http_set_status(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = set_task_status_handler(
+        task_id=request.path_params["task_id"],
+        status=body.get("status", ""),
+        actor=body.get("actor", "operator"),
+        note=body.get("note", ""),
+        allow_override=bool(body.get("allow_override", False)),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
+@mcp.custom_route("/tasks/{task_id}/quarantine", methods=["POST"])
+async def http_quarantine(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = quarantine_task_handler(
+        task_id=request.path_params["task_id"],
+        actor=body.get("actor", "operator"),
+        note=body.get("note", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
+@mcp.custom_route("/tasks/{task_id}/restore", methods=["POST"])
+async def http_restore(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = restore_task_handler(
+        task_id=request.path_params["task_id"],
+        actor=body.get("actor", "operator"),
+        note=body.get("note", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
 
 
 if __name__ == "__main__":
