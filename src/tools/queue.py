@@ -1,18 +1,25 @@
 import fcntl
-import os
 import glob
-import uuid
 import logging
+import os
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+from datetime import datetime, timedelta, timezone
 
 import yaml
 
 logger = logging.getLogger(__name__)
 
 VALID_RISK_LEVELS = {"low", "medium", "high"}
-VALID_STATUSES = {"submitted", "approved", "pending-approval", "in-progress", "completed", "failed", "cancelled"}
+VALID_STATUSES = {
+    "submitted",
+    "approved",
+    "pending-approval",
+    "in-progress",
+    "completed",
+    "failed",
+    "cancelled",
+}
 VALID_PRIORITIES = {"normal", "high", "urgent"}
 VALID_TASK_TYPES = {"build", "deploy", "fix", "research", "review", "audit", "notify"}
 VALID_WORKFLOW_MODES = {"semi-auto", "auto"}
@@ -22,7 +29,7 @@ NON_TERMINAL_STATUSES = VALID_STATUSES - TERMINAL_STATUSES
 # Valid source statuses for each target transition in update_task (agent-facing, strict).
 # NB: `cancelled` is operator-only and is NOT reachable here — agents cannot cancel.
 VALID_TRANSITIONS: dict[str, set[str]] = {
-    "in-progress": {"approved"},          # agents must not claim unapproved tasks
+    "in-progress": {"approved"},  # agents must not claim unapproved tasks
     "completed": {"in-progress"},
     "failed": NON_TERMINAL_STATUSES,
 }
@@ -33,7 +40,7 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
 # Terminal tasks are always immutable, even for operators.
 OPERATOR_TRANSITIONS: dict[str, set[str]] = {
     "approved": {"submitted", "pending-approval"},
-    "cancelled": NON_TERMINAL_STATUSES,   # any non-terminal task may be cancelled
+    "cancelled": NON_TERMINAL_STATUSES,  # any non-terminal task may be cancelled
 }
 
 QUARANTINE_DIRNAME = "quarantine"
@@ -45,10 +52,10 @@ QUARANTINE_DIRNAME = "quarantine"
 _CONTEXT_REF_MIN_LEN = 2  # at minimum "/<char>"
 
 
-def _load_task_file(path: str) -> Optional[dict]:
+def _load_task_file(path: str) -> dict | None:
     """Load a single YAML task file. Returns None on parse or type error."""
     try:
-        with open(path, "r") as f:
+        with open(path) as f:
             data = yaml.safe_load(f)
         if isinstance(data, dict):
             return data
@@ -110,7 +117,7 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _validate_context_refs(context_refs: list) -> Optional[str]:
+def _validate_context_refs(context_refs: list) -> str | None:
     """Return an error string if any context_ref is invalid, else None."""
     for ref in context_refs:
         if not isinstance(ref, str) or not ref.startswith("/") or len(ref) < _CONTEXT_REF_MIN_LEN:
@@ -136,6 +143,7 @@ def _task_lock(queue_dir: str, task_id: str):
 # Tool handlers
 # ---------------------------------------------------------------------------
 
+
 def submit_task_handler(
     source_agent: str,
     target_agent: str,
@@ -145,11 +153,11 @@ def submit_task_handler(
     risk_level: str = "low",
     requires_approval: bool = False,
     priority: str = "normal",
-    context_refs: list = None,
+    context_refs: list | None = None,
     ttl_days: int = 30,
     workflow_mode: str = "semi-auto",
-    originating_task_id: Optional[str] = None,
-    queue_dir: str = None,
+    originating_task_id: str | None = None,
+    queue_dir: str | None = None,
 ) -> dict:
     if context_refs is None:
         context_refs = []
@@ -163,20 +171,45 @@ def submit_task_handler(
     if not summary or not summary.strip():
         return {"ok": False, "error": "summary must not be empty"}
     if task_type not in VALID_TASK_TYPES:
-        return {"ok": False, "error": f"Invalid task_type: {task_type!r}. Must be one of: {sorted(VALID_TASK_TYPES)}"}
+        return {
+            "ok": False,
+            "error": (
+                f"Invalid task_type: {task_type!r}. Must be one of: {sorted(VALID_TASK_TYPES)}"
+            ),
+        }
     if risk_level not in VALID_RISK_LEVELS:
-        return {"ok": False, "error": f"Invalid risk_level: {risk_level!r}. Must be one of: {sorted(VALID_RISK_LEVELS)}"}
+        return {
+            "ok": False,
+            "error": (
+                f"Invalid risk_level: {risk_level!r}. Must be one of: {sorted(VALID_RISK_LEVELS)}"
+            ),
+        }
     if priority not in VALID_PRIORITIES:
-        return {"ok": False, "error": f"Invalid priority: {priority!r}. Must be one of: {sorted(VALID_PRIORITIES)}"}
+        return {
+            "ok": False,
+            "error": f"Invalid priority: {priority!r}. Must be one of: {sorted(VALID_PRIORITIES)}",
+        }
     if workflow_mode not in VALID_WORKFLOW_MODES:
-        return {"ok": False, "error": f"Invalid workflow_mode: {workflow_mode!r}. Must be one of: {sorted(VALID_WORKFLOW_MODES)}"}
+        return {
+            "ok": False,
+            "error": (
+                f"Invalid workflow_mode: {workflow_mode!r}. "
+                f"Must be one of: {sorted(VALID_WORKFLOW_MODES)}"
+            ),
+        }
     if not isinstance(ttl_days, int) or ttl_days < 1:
-        return {"ok": False, "error": f"Invalid ttl_days: {ttl_days!r}. Must be a positive integer."}
+        return {
+            "ok": False,
+            "error": f"Invalid ttl_days: {ttl_days!r}. Must be a positive integer.",
+        }
     if originating_task_id is not None:
         try:
             uuid.UUID(originating_task_id)
         except ValueError:
-            return {"ok": False, "error": f"Invalid originating_task_id: {originating_task_id!r} — must be a UUID"}
+            return {
+                "ok": False,
+                "error": f"Invalid originating_task_id: {originating_task_id!r} — must be a UUID",
+            }
 
     if context_refs:
         err = _validate_context_refs(context_refs)
@@ -239,13 +272,13 @@ def submit_task_handler(
 
 
 def list_tasks_handler(
-    target_agent: str = None,
-    source_agent: str = None,
-    status: str = None,
-    task_type: str = None,
+    target_agent: str | None = None,
+    source_agent: str | None = None,
+    status: str | None = None,
+    task_type: str | None = None,
     include_archived: bool = False,
     limit: int = 20,
-    queue_dir: str = None,
+    queue_dir: str | None = None,
 ) -> list:
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
@@ -265,9 +298,8 @@ def list_tasks_handler(
         # dispatcher falls behind.
         created = task.get("created")
         ttl_days = task.get("ttl_days", 30)
-        if created and isinstance(created, datetime):
-            if now > created + timedelta(days=ttl_days):
-                continue
+        if created and isinstance(created, datetime) and now > created + timedelta(days=ttl_days):
+            continue
 
         if target_agent and task.get("target_agent") != target_agent:
             continue
@@ -291,7 +323,7 @@ def list_tasks_handler(
     return [{k: v for k, v in t.items() if k != "_path"} for t in filtered[:limit]]
 
 
-def get_task_handler(task_id: str, queue_dir: str = None) -> dict:
+def get_task_handler(task_id: str, queue_dir: str | None = None) -> dict:
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
 
@@ -314,8 +346,8 @@ def update_task_handler(
     status: str,
     actor: str,
     note: str = "",
-    output: str = None,
-    queue_dir: str = None,
+    output: str | None = None,
+    queue_dir: str | None = None,
 ) -> dict:
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
@@ -327,7 +359,12 @@ def update_task_handler(
 
     valid_update_statuses = {"in-progress", "completed", "failed"}
     if status not in valid_update_statuses:
-        return {"ok": False, "error": f"Invalid status: {status!r}. update_task accepts: {sorted(valid_update_statuses)}"}
+        return {
+            "ok": False,
+            "error": (
+                f"Invalid status: {status!r}. update_task accepts: {sorted(valid_update_statuses)}"
+            ),
+        }
 
     with _task_lock(queue_dir, task_id):
         tasks = _load_all_tasks(queue_dir, include_archived=True)
@@ -342,13 +379,19 @@ def update_task_handler(
         current_status = task.get("status")
 
         if current_status in TERMINAL_STATUSES:
-            return {"ok": False, "error": f"Task is in terminal status {current_status!r} and cannot be updated"}
+            return {
+                "ok": False,
+                "error": f"Task is in terminal status {current_status!r} and cannot be updated",
+            }
 
         allowed_from = VALID_TRANSITIONS.get(status, set())
         if current_status not in allowed_from:
             return {
                 "ok": False,
-                "error": f"Invalid transition: {current_status!r} → {status!r}. Allowed from: {sorted(allowed_from)}",
+                "error": (
+                    f"Invalid transition: {current_status!r} → {status!r}. "
+                    f"Allowed from: {sorted(allowed_from)}"
+                ),
             }
 
         now = _now()
@@ -386,7 +429,7 @@ def set_task_status_handler(
     actor: str,
     note: str = "",
     allow_override: bool = False,
-    queue_dir: str = None,
+    queue_dir: str | None = None,
 ) -> dict:
     """
     Operator-facing status change. Broader than update_task but audited and bounded:
@@ -408,7 +451,10 @@ def set_task_status_handler(
         return {"ok": False, "error": "invalid task_id format"}
 
     if status not in VALID_STATUSES:
-        return {"ok": False, "error": f"Invalid status: {status!r}. Must be one of: {sorted(VALID_STATUSES)}"}
+        return {
+            "ok": False,
+            "error": f"Invalid status: {status!r}. Must be one of: {sorted(VALID_STATUSES)}",
+        }
 
     if not actor or not actor.strip():
         return {"ok": False, "error": "actor must not be empty"}
@@ -426,7 +472,10 @@ def set_task_status_handler(
         current_status = task.get("status")
 
         if current_status in TERMINAL_STATUSES:
-            return {"ok": False, "error": f"Task is in terminal status {current_status!r} and cannot be updated"}
+            return {
+                "ok": False,
+                "error": f"Task is in terminal status {current_status!r} and cannot be updated",
+            }
 
         standard_ok = current_status in OPERATOR_TRANSITIONS.get(status, set())
         override_ok = (
@@ -447,7 +496,10 @@ def set_task_status_handler(
             }
 
         if override_ok and not standard_ok and not (note and note.strip()):
-            return {"ok": False, "error": "an override transition requires a non-empty note for the audit trail"}
+            return {
+                "ok": False,
+                "error": "an override transition requires a non-empty note for the audit trail",
+            }
 
         now = _now()
         task["status"] = status
@@ -476,7 +528,11 @@ def set_task_status_handler(
 
     logger.info(
         "task.operator_transition id=%s %s→%s actor=%s override=%s",
-        task_id[:8], current_status, status, actor, override_ok and not standard_ok,
+        task_id[:8],
+        current_status,
+        status,
+        actor,
+        override_ok and not standard_ok,
     )
     return {"ok": True, "task_id": task_id}
 
@@ -485,7 +541,7 @@ def cancel_task_handler(
     task_id: str,
     actor: str,
     note: str = "",
-    queue_dir: str = None,
+    queue_dir: str | None = None,
 ) -> dict:
     """
     Cancel a task: a graceful, audited terminal state for stale/unwanted tasks.
@@ -513,7 +569,7 @@ def quarantine_task_handler(
     task_id: str,
     actor: str,
     note: str = "",
-    queue_dir: str = None,
+    queue_dir: str | None = None,
 ) -> dict:
     """
     Isolate a task by moving its YAML to <queue_dir>/quarantine/ (recoverable, not deleted).
@@ -570,7 +626,7 @@ def restore_task_handler(
     task_id: str,
     actor: str,
     note: str = "",
-    queue_dir: str = None,
+    queue_dir: str | None = None,
 ) -> dict:
     """
     Restore a quarantined task: move its YAML back to the active queue dir and audit it.

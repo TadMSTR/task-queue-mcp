@@ -1,24 +1,23 @@
 import hmac
 import json
+import logging
 import os
 import sys
-import logging
 from contextlib import asynccontextmanager
-from typing import Optional
 
 from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from src.tools.queue import (
-    submit_task_handler,
-    list_tasks_handler,
-    get_task_handler,
-    update_task_handler,
-    set_task_status_handler,
     cancel_task_handler,
+    get_task_handler,
+    list_tasks_handler,
     quarantine_task_handler,
     restore_task_handler,
+    set_task_status_handler,
+    submit_task_handler,
+    update_task_handler,
 )
 
 logging.basicConfig(
@@ -57,10 +56,10 @@ def submit_task(
     risk_level: str = "low",
     requires_approval: bool = False,
     priority: str = "normal",
-    context_refs: list[str] = None,
+    context_refs: list[str] | None = None,
     ttl_days: int = 30,
     workflow_mode: str = "semi-auto",
-    originating_task_id: Optional[str] = None,
+    originating_task_id: str | None = None,
 ) -> dict:
     """
     Submit a new task to the queue.
@@ -90,10 +89,10 @@ def submit_task(
 
 @mcp.tool()
 def list_tasks(
-    target_agent: str = None,
-    source_agent: str = None,
-    status: str = None,
-    task_type: str = None,
+    target_agent: str | None = None,
+    source_agent: str | None = None,
+    status: str | None = None,
+    task_type: str | None = None,
     include_archived: bool = False,
     limit: int = 20,
 ) -> list:
@@ -128,7 +127,7 @@ def update_task(
     status: str,
     actor: str,
     note: str = "",
-    output: str = None,
+    output: str | None = None,
 ) -> dict:
     """
     Update task status and append a history entry.

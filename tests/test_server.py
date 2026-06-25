@@ -15,6 +15,7 @@ import yaml
 def server(tmp_path, monkeypatch):
     """Import src.server with QUEUE_DIR pointed at an isolated tmp queue."""
     import src.server as srv
+
     importlib.reload(srv)
     monkeypatch.setattr(srv, "QUEUE_DIR", str(tmp_path))
     return srv
@@ -73,8 +74,11 @@ def test_server_set_task_status_override(server, tmp_path):
     r = _submit(server)
     _set_status_on_disk(tmp_path, r["filename"], "approved")
     out = server.set_task_status(
-        task_id=r["task_id"], status="in-progress", actor="ted",
-        note="advance", allow_override=True,
+        task_id=r["task_id"],
+        status="in-progress",
+        actor="ted",
+        note="advance",
+        allow_override=True,
     )
     assert out["ok"] is True
 

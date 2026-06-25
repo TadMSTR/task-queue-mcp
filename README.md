@@ -1,5 +1,8 @@
 # task-queue-mcp
 
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-6B57FF?logo=claude&logoColor=white)](https://claude.ai/code)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A [FastMCP](https://github.com/jlowin/fastmcp) server that exposes the agent orchestration task queue as an MCP tool interface. Agents submit tasks, check status, and record completions through typed, validated tools instead of raw YAML file writes.
 
 Runs as a Docker container on port 8485. Wired globally into `~/.claude.json` so all Claude Code agent sessions have access.
@@ -10,8 +13,16 @@ Runs as a Docker container on port 8485. Wired globally into `~/.claude.json` so
 |------|-------------|
 | `submit_task` | Create a new task with `status: submitted` |
 | `list_tasks` | List tasks with optional filters; TTL-expired tasks excluded |
-| `get_task` | Retrieve a single task by UUID |
-| `update_task` | Transition status and append a history entry |
+| `get_task` | Retrieve a single task by UUID (resolves archived + quarantined) |
+| `update_task` | Agent-facing status transition (strict); appends a history entry |
+| `set_task_status` | Operator status change — approve, cancel, or advance a missed task (audited override) |
+| `cancel_task` | Graceful terminal `cancelled` state for stale tasks (record kept, never deleted) |
+| `quarantine_task` | Isolate a task to `quarantine/` (recoverable); drops from `list_tasks` |
+| `restore_task` | Restore a quarantined task to the active queue |
+
+Agents use the strict `update_task` path; operators (via the HTTP control API) use
+`set_task_status` / `cancel_task` / `quarantine_task` / `restore_task`. Agents cannot
+cancel — `cancelled` is operator-only.
 
 ### submit_task
 
@@ -81,9 +92,21 @@ update_task(
 | Any non-terminal | `failed` |
 
 Non-terminal: `submitted`, `pending-approval`, `approved`, `in-progress`.
-Terminal: `completed`, `failed`.
+Terminal: `completed`, `failed`, `cancelled`.
 
 `alert_state` and `retry_policy` are dispatcher-owned — `update_task` never touches them.
+
+### Operator transitions (`set_task_status`)
+
+Broader than `update_task` but still audited and bounded:
+
+| From | To | Notes |
+|------|----|-------|
+| `submitted` / `pending-approval` | `approved` | standard |
+| Any non-terminal | `cancelled` | standard (also via `cancel_task`) |
+| Any non-terminal | Any non-terminal | requires `allow_override=True` + a non-empty note (the "advance a missed task" override) |
+
+Terminal tasks are immutable even for operators. Every operator change appends a history entry with `actor` + `note`.
 
 ## Status Lifecycle
 
@@ -91,9 +114,32 @@ Terminal: `completed`, `failed`.
 submitted → [pending-approval] → approved → in-progress → completed
                                                  ↓
                                               failed
+
+Any non-terminal ──(operator)──> cancelled        # graceful dismissal, record kept
+Any task ──(operator quarantine)──> quarantine/    # isolate (recoverable via restore)
 ```
 
-The dispatcher owns the `submitted → approved/pending-approval` transitions. Agents own `approved → in-progress → completed` (or `failed`). Approval gating is controlled by agent manifests and the `requires_approval` field.
+The dispatcher owns the `submitted → approved/pending-approval` transitions. Agents own `approved → in-progress → completed` (or `failed`). Operators own `cancelled`, quarantine/restore, and audited status overrides. Approval gating is controlled by agent manifests and the `requires_approval` field.
+
+## HTTP Control API
+
+Non-MCP clients (the CloudCLI plugin and Matrix bot) can't import the Python core, so all their mutations go through a thin HTTP control API mounted as FastMCP custom routes on the **same port 8485**. Each endpoint delegates to the tool handlers above, inheriting transition validation, `fcntl` locking, and atomic writes — so there is exactly one validated write path for the whole system.
+
+| Method | Path | Delegates to |
+|--------|------|--------------|
+| `POST` | `/tasks/{id}/approve` | `set_task_status(approved)` |
+| `POST` | `/tasks/{id}/cancel` | `cancel_task` |
+| `POST` | `/tasks/{id}/status` | `set_task_status` (body: `status`, `note`, `allow_override`) |
+| `POST` | `/tasks/{id}/quarantine` | `quarantine_task` |
+| `POST` | `/tasks/{id}/restore` | `restore_task` |
+
+Body fields: `actor` (default `operator`), `note`, plus `status` / `allow_override` for the status route. Responses map the canonical result: `200` ok, `404` not found, `400` validation/transition error.
+
+**Auth:** custom routes bypass the MCP auth middleware, so a shared-secret header is the gate (defense in depth on top of the loopback-published port):
+
+- Send `X-Task-Queue-Secret: $TASK_QUEUE_API_SECRET` on every mutation.
+- The server compares it in constant time (`hmac.compare_digest`) and **fails closed** (401) when the secret is missing, wrong, or unconfigured.
+- The secret lives in `~/.secrets/forge.env` and is injected via env into the container, bot, and plugin — never committed to source.
 
 ## Deployment
 
@@ -144,6 +190,7 @@ The container mounts only the task-queue directory read-write. The rest of the f
 | `TASK_QUEUE_DIR` | `/task-queue` | Path to the task queue directory inside the container |
 | `MCP_HOST` | `0.0.0.0` | Bind host for the HTTP server |
 | `MCP_PORT` | `8485` | Port for the HTTP server |
+| `TASK_QUEUE_API_SECRET` | — | Shared secret for the HTTP control API. **Required** for any control-API mutation — fails closed (401) if unset. The MCP tools themselves do not use it. |
 
 ## Building
 
@@ -163,11 +210,22 @@ pytest
 TASK_QUEUE_DIR=/home/ted/.claude/task-queue python -m src.server
 ```
 
-The test suite (21 tests) covers all four tools including validation edge cases and adversarial YAML strings. All writes use `yaml.dump` — never string interpolation — to prevent YAML injection.
+```bash
+pip install -r requirements.txt pytest pytest-cov ruff
+
+# Lint + format (Baseline gate)
+ruff check .
+ruff format --check .
+
+# Tests with coverage (gate: >=80%)
+python -m pytest --cov=src --cov-report=term-missing
+```
+
+The test suite covers all eight tools and the HTTP control API — validation edge cases, adversarial YAML strings, illegal transitions, the quarantine/restore round-trip, operator-override auditing, and the shared-secret gate (missing/wrong secret → 401). All writes use `yaml.dump` — never string interpolation — to prevent YAML injection.
 
 ## Security
 
-Port 8485 is unauthenticated. Access is limited to LAN only — the port is not proxied externally via SWAG and the host firewall blocks external access. The container runs as UID 1000 with `cap_drop: ALL` and `no-new-privileges`.
+The MCP tool endpoint on port 8485 is unauthenticated and limited to LAN/loopback — the port is not proxied externally via SWAG and the host firewall blocks external access. The **HTTP control API** mutation routes additionally require a shared-secret header (`X-Task-Queue-Secret`, constant-time compare, fail-closed) — see [HTTP Control API](#http-control-api). The container runs as UID 1000 with `cap_drop: ALL`, `no-new-privileges`, and a read-only rootfs (only `/task-queue` is writable).
 
 ## Task File Schema
 

@@ -12,7 +12,7 @@ import pytest
 import yaml
 from starlette.testclient import TestClient
 
-from src.tools.queue import submit_task_handler, get_task_handler
+from src.tools.queue import get_task_handler, submit_task_handler
 
 SECRET = "test-secret-value"
 AUTH = {"X-Task-Queue-Secret": SECRET}
@@ -22,6 +22,7 @@ AUTH = {"X-Task-Queue-Secret": SECRET}
 def env(tmp_path, monkeypatch):
     """Reload src.server with QUEUE_DIR -> tmp and a known API secret."""
     import src.server as srv
+
     importlib.reload(srv)
     monkeypatch.setattr(srv, "QUEUE_DIR", str(tmp_path))
     monkeypatch.setenv("TASK_QUEUE_API_SECRET", SECRET)
@@ -37,8 +38,12 @@ def client(env):
 
 def _seed(tmp_path, status=None):
     r = submit_task_handler(
-        source_agent="research", target_agent="developer", task_type="build",
-        summary="s", description="d", queue_dir=str(tmp_path),
+        source_agent="research",
+        target_agent="developer",
+        task_type="build",
+        summary="s",
+        description="d",
+        queue_dir=str(tmp_path),
     )
     if status:
         path = tmp_path / r["filename"]
@@ -51,6 +56,7 @@ def _seed(tmp_path, status=None):
 
 
 # ── auth gate ──────────────────────────────────────────────────────────
+
 
 def test_approve_missing_secret_rejected(env, client):
     _, tmp_path = env
@@ -83,6 +89,7 @@ def test_no_secret_configured_fails_closed(env, tmp_path, monkeypatch):
 
 
 # ── happy paths ────────────────────────────────────────────────────────
+
 
 def test_approve_ok(env, client):
     _, tmp_path = env
@@ -126,8 +133,10 @@ def test_quarantine_then_restore_ok(env, client):
 
 # ── error surfacing ────────────────────────────────────────────────────
 
+
 def test_approve_not_found_404(env, client):
     import uuid
+
     resp = client.post(f"/tasks/{uuid.uuid4()}/approve", headers=AUTH, json={"actor": "ted"})
     assert resp.status_code == 404
 
