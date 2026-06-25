@@ -11,6 +11,10 @@ from src.tools.queue import (
     list_tasks_handler,
     get_task_handler,
     update_task_handler,
+    set_task_status_handler,
+    cancel_task_handler,
+    quarantine_task_handler,
+    restore_task_handler,
 )
 
 logging.basicConfig(
@@ -136,6 +140,59 @@ def update_task(
         output=output,
         queue_dir=QUEUE_DIR,
     )
+
+
+@mcp.tool()
+def set_task_status(
+    task_id: str,
+    status: str,
+    actor: str,
+    note: str = "",
+    allow_override: bool = False,
+) -> dict:
+    """
+    Operator status change (broader than update_task). Standard transitions:
+    submitted/pending-approval→approved, any non-terminal→cancelled. Set
+    allow_override=True (with a non-empty note) to advance a missed task between any
+    two non-terminal statuses. Terminal tasks are immutable. Returns {ok, task_id}.
+    """
+    return set_task_status_handler(
+        task_id=task_id,
+        status=status,
+        actor=actor,
+        note=note,
+        allow_override=allow_override,
+        queue_dir=QUEUE_DIR,
+    )
+
+
+@mcp.tool()
+def cancel_task(task_id: str, actor: str, note: str = "") -> dict:
+    """
+    Cancel a task — a graceful, audited terminal state for stale or unwanted tasks
+    (use instead of mislabeling them `failed`). The record stays on disk. Returns
+    {ok, task_id} or {ok: false, error}.
+    """
+    return cancel_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
+
+
+@mcp.tool()
+def quarantine_task(task_id: str, actor: str, note: str = "") -> dict:
+    """
+    Isolate a task by moving its YAML to quarantine/ (recoverable, not deleted). It drops
+    out of list_tasks but stays resolvable via get_task and restorable via restore_task.
+    Returns {ok, task_id} or {ok: false, error}.
+    """
+    return quarantine_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
+
+
+@mcp.tool()
+def restore_task(task_id: str, actor: str, note: str = "") -> dict:
+    """
+    Restore a quarantined task back to the active queue. Reverses quarantine_task.
+    Returns {ok, task_id} or {ok: false, error}.
+    """
+    return restore_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
 
 
 if __name__ == "__main__":
