@@ -88,6 +88,23 @@ def test_no_secret_configured_fails_closed(env, tmp_path, monkeypatch):
     assert resp.status_code == 401
 
 
+def test_non_ascii_secret_header_rejected_cleanly(env, client):
+    """A non-ASCII secret header must yield a clean 401, not a 500 (audit L-02).
+
+    Sent as latin-1 bytes — Starlette decodes request headers as latin-1, so the server
+    sees a non-ASCII str, which would make a str-based hmac.compare_digest raise TypeError.
+    """
+    _, tmp_path = env
+    tid = _seed(tmp_path)
+    resp = client.post(
+        f"/tasks/{tid}/approve",
+        headers={"X-Task-Queue-Secret": "wrong-café".encode("latin-1")},
+        json={"actor": "ted"},
+    )
+    assert resp.status_code == 401
+    assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "submitted"
+
+
 # ── happy paths ────────────────────────────────────────────────────────
 
 

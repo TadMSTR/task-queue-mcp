@@ -219,7 +219,9 @@ def _authorized(request: Request) -> bool:
         logger.warning("TASK_QUEUE_API_SECRET not configured — rejecting control-API request")
         return False
     provided = request.headers.get(SECRET_HEADER, "")
-    return hmac.compare_digest(provided, secret)
+    # Compare as bytes — hmac.compare_digest raises TypeError on str operands with
+    # non-ASCII chars, so a malformed header must not escape as a 500. (audit L-02)
+    return hmac.compare_digest(provided.encode("utf-8"), secret.encode("utf-8"))
 
 
 async def _json_body(request: Request) -> dict:

@@ -227,6 +227,10 @@ The test suite covers all eight tools and the HTTP control API — validation ed
 
 The MCP tool endpoint on port 8485 is unauthenticated and limited to LAN/loopback — the port is not proxied externally via SWAG and the host firewall blocks external access. The **HTTP control API** mutation routes additionally require a shared-secret header (`X-Task-Queue-Secret`, constant-time compare, fail-closed) — see [HTTP Control API](#http-control-api). The container runs as UID 1000 with `cap_drop: ALL`, `no-new-privileges`, and a read-only rootfs (only `/task-queue` is writable).
 
+### Trust model
+
+**Loopback is the trust boundary.** The shared secret gates only the cross-process HTTP control routes (`/tasks/...`) — it is *not* the sole barrier to mutation. All MCP tools, including the operator-mutating `set_task_status` / `cancel_task` / `quarantine_task` / `restore_task`, are reachable via the unauthenticated `/mcp/` JSON-RPC endpoint, so **any process with loopback access to port 8485 can mutate the queue without the secret.** This is intentional: the queue is internal agent-coordination state, the port is loopback-only, and the MCP transport has always been unauthenticated. The secret exists to authenticate the *specific* cross-process clients (the CloudCLI plugin and Matrix bot) over plain HTTP, not to harden the loopback boundary. If loopback trust ever becomes insufficient, gate the MCP transport with a FastMCP auth provider rather than relying on the control-route secret alone.
+
 ## Task File Schema
 
 Tasks are YAML files in `~/.claude/task-queue/`, named `YYYYMMDD-HHMMSS-<uuid-prefix>.yml`. All writes are atomic (write to `.tmp`, then `os.rename()`). Per-task file locks via `fcntl.flock` prevent races between concurrent MCP calls and the dispatcher.
