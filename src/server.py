@@ -1,3 +1,5 @@
+import hmac
+import json
 import os
 import sys
 import logging
@@ -5,6 +7,8 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from src.tools.queue import (
     submit_task_handler,
@@ -193,6 +197,131 @@ def restore_task(task_id: str, actor: str, note: str = "") -> dict:
     Returns {ok, task_id} or {ok: false, error}.
     """
     return restore_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
+
+
+# ---------------------------------------------------------------------------
+# HTTP control API — the single validated mutation path for non-MCP clients
+# (the CloudCLI plugin and the Matrix bot). Mounted as custom routes on the
+# existing FastMCP HTTP app, so it shares this container and port 8485.
+#
+# These routes are NOT behind the MCP auth middleware, so the shared secret is
+# the only gate (defense-in-depth on top of the loopback-published port). Every
+# route delegates to the same handlers as the MCP tools, inheriting transition
+# validation + fcntl locking + atomic writes. Reads stay direct in the clients.
+# ---------------------------------------------------------------------------
+
+SECRET_HEADER = "X-Task-Queue-Secret"
+
+
+def _authorized(request: Request) -> bool:
+    """Constant-time shared-secret check. Fails closed when no secret is configured."""
+    secret = os.environ.get("TASK_QUEUE_API_SECRET", "")
+    if not secret:
+        logger.warning("TASK_QUEUE_API_SECRET not configured — rejecting control-API request")
+        return False
+    provided = request.headers.get(SECRET_HEADER, "")
+    return hmac.compare_digest(provided, secret)
+
+
+async def _json_body(request: Request) -> dict:
+    """Parse a JSON request body, tolerating an empty body. Returns {} on empty/invalid."""
+    raw = await request.body()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _status_for(result: dict) -> int:
+    if result.get("ok"):
+        return 200
+    if result.get("error") == "not found":
+        return 404
+    return 400
+
+
+def _control_response(result: dict) -> JSONResponse:
+    return JSONResponse(result, status_code=_status_for(result))
+
+
+def _unauthorized() -> JSONResponse:
+    return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+
+@mcp.custom_route("/tasks/{task_id}/approve", methods=["POST"])
+async def http_approve(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = set_task_status_handler(
+        task_id=request.path_params["task_id"],
+        status="approved",
+        actor=body.get("actor", "operator"),
+        note=body.get("note", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
+@mcp.custom_route("/tasks/{task_id}/cancel", methods=["POST"])
+async def http_cancel(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = cancel_task_handler(
+        task_id=request.path_params["task_id"],
+        actor=body.get("actor", "operator"),
+        note=body.get("note", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
+@mcp.custom_route("/tasks/{task_id}/status", methods=["POST"])
+async def http_set_status(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = set_task_status_handler(
+        task_id=request.path_params["task_id"],
+        status=body.get("status", ""),
+        actor=body.get("actor", "operator"),
+        note=body.get("note", ""),
+        allow_override=bool(body.get("allow_override", False)),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
+@mcp.custom_route("/tasks/{task_id}/quarantine", methods=["POST"])
+async def http_quarantine(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = quarantine_task_handler(
+        task_id=request.path_params["task_id"],
+        actor=body.get("actor", "operator"),
+        note=body.get("note", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
+@mcp.custom_route("/tasks/{task_id}/restore", methods=["POST"])
+async def http_restore(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = restore_task_handler(
+        task_id=request.path_params["task_id"],
+        actor=body.get("actor", "operator"),
+        note=body.get("note", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
 
 
 if __name__ == "__main__":
