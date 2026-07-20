@@ -1,6 +1,6 @@
 [project]
 name = "task-queue-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "FastMCP server exposing the agent orchestration task queue as MCP tools"
 requires-python = ">=3.10"
 dependencies = [

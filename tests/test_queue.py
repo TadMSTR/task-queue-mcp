@@ -812,6 +812,43 @@ def test_set_status_override_cannot_reach_terminal(tmp_path):
     assert "Invalid operator transition" in r["error"]
 
 
+def test_set_status_completed_hints_at_update_task(tmp_path):
+    """in-progress→completed is rejected here, but the error must point the caller
+    at update_task — the exact transition that tripped up the security agent."""
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "in-progress")
+    r = set_task_status_handler(
+        task_id=result["task_id"],
+        status="completed",
+        actor="ted",
+        note="done",
+        allow_override=True,
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is False
+    assert "Invalid operator transition" in r["error"]
+    assert "update_task" in r["error"]
+
+
+def test_set_status_cancel_does_not_hint_at_update_task(tmp_path):
+    """A genuinely operator-only transition (→cancelled) must NOT mention update_task —
+    the hint is only for transitions update_task actually accepts."""
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "in-progress")
+    # cancel from in-progress is a standard operator move → succeeds, no error to check.
+    # Force the rejection path with an invalid target that update_task also rejects:
+    # submitted is neither an operator target from in-progress nor accepted by update_task.
+    r = set_task_status_handler(
+        task_id=result["task_id"],
+        status="submitted",
+        actor="ted",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is False
+    assert "Invalid operator transition" in r["error"]
+    assert "update_task" not in r["error"]
+
+
 # ---------------------------------------------------------------------------
 # cancel_task tests
 # ---------------------------------------------------------------------------
