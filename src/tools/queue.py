@@ -485,15 +485,25 @@ def set_task_status_handler(
         )
 
         if not (standard_ok or override_ok):
-            return {
-                "ok": False,
-                "error": (
-                    f"Invalid operator transition: {current_status!r} → {status!r}. "
-                    f"Standard targets: approved (from submitted/pending-approval), "
-                    f"cancelled (from any non-terminal). For other non-terminal moves pass "
-                    f"allow_override=True."
-                ),
-            }
+            error = (
+                f"Invalid operator transition: {current_status!r} → {status!r}. "
+                f"Standard targets: approved (from submitted/pending-approval), "
+                f"cancelled (from any non-terminal). For other non-terminal moves pass "
+                f"allow_override=True."
+            )
+            # If this exact transition is one the agent-facing update_task tool accepts
+            # (e.g. in-progress→completed, approved→in-progress, or →failed), point the
+            # caller there. set_task_status is operator-only and structurally cannot reach
+            # terminal statuses even with allow_override — the forward
+            # in-progress→completed path lives on update_task. Naming it here is what
+            # actually unblocks agents that hit this wall instead of retrying override.
+            if current_status in VALID_TRANSITIONS.get(status, set()):
+                error += (
+                    " This transition is available via update_task (agent-facing) — "
+                    "set_task_status is operator-only and cannot reach terminal statuses "
+                    "via override."
+                )
+            return {"ok": False, "error": error}
 
         if override_ok and not standard_ok and not (note and note.strip()):
             return {
