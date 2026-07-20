@@ -837,9 +837,10 @@ def test_set_status_cancel_does_not_hint_at_update_task(tmp_path):
     set_task_status(tmp_path, result, "in-progress")
     # cancel from in-progress is a standard operator move → succeeds, no error to check.
     # Force the rejection path with an invalid target that update_task also rejects:
+    # submitted is neither an operator target from in-progress nor accepted by update_task.
     r = set_task_status_handler(
         task_id=result["task_id"],
-        status="submitted",  # not an operator target from in-progress, and update_task rejects it too
+        status="submitted",
         actor="ted",
         queue_dir=str(tmp_path),
     )
