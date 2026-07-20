@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-20
+
+### Changed
+- `set_task_status`'s rejection error now points at `update_task` when the
+  rejected `(current → target)` transition is one `update_task` accepts
+  (`approved→in-progress`, `in-progress→completed`, or `→failed` from any
+  non-terminal). `set_task_status` is operator-only and structurally cannot
+  reach terminal statuses even with `allow_override`; the forward
+  `in-progress→completed` path lives on `update_task`. Message-only — no change
+  to `VALID_TRANSITIONS`/`OPERATOR_TRANSITIONS` semantics.
+
 ## [0.3.0] - 2026-06-25
 
 ### Added
