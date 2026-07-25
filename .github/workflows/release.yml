@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # Required for gh release create
+
+# Source-only release (no PyPI) — same pattern as matrix-dispatcher/agent-bus/dockhand-mcp/githost-mcp.
+# A tag `vX.Y.Z` cuts a GitHub Release with auto-generated notes.
+jobs:
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release (source only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if gh release view "${TAG_NAME}" &>/dev/null; then
+            echo "Release ${TAG_NAME} already exists; nothing to do."
+          else
+            gh release create "${TAG_NAME}" \
+              --title "${TAG_NAME}" \
+              --generate-notes \
+              --verify-tag
+          fi
