@@ -29,16 +29,16 @@ cancel — `cancelled` is operator-only.
 ```python
 submit_task(
     source_agent="research",
-    target_agent="claudebox",       # agent name or "auto" for dispatcher routing
-    task_type="build",              # build | deploy | fix | research | review | audit | notify
+    target_agent="claudebox",  # agent name or "auto" for dispatcher routing
+    task_type="build",  # build | deploy | fix | research | review | audit | notify
     summary="Deploy qmd update",
     description="Apply the qmd stack update from build plan...",
-    risk_level="low",               # low | medium | high (default: low)
-    requires_approval=False,        # explicit override of approval gate
-    priority="normal",              # normal | high | urgent (default: normal)
+    risk_level="low",  # low | medium | high (default: low)
+    requires_approval=False,  # explicit override of approval gate
+    priority="normal",  # normal | high | urgent (default: normal)
     context_refs=["/home/ted/.claude/projects/research/build-plans/qmd/plan.md"],
     ttl_days=30,
-    workflow_mode="semi-auto",          # semi-auto | auto (default: semi-auto)
+    workflow_mode="semi-auto",  # semi-auto | auto (default: semi-auto)
 )
 # → {"ok": true, "task_id": "<uuid>", "filename": "<timestamp>-<slug>.yml"}
 ```
@@ -49,12 +49,12 @@ submit_task(
 
 ```python
 list_tasks(
-    target_agent="claudebox",       # optional
-    source_agent="research",        # optional
+    target_agent="claudebox",  # optional
+    source_agent="research",  # optional
     status="approved,in-progress",  # comma-separated, optional
-    task_type="build",              # optional
-    include_archived=False,         # include archive/ subdirectory
-    limit=20,                       # max 200
+    task_type="build",  # optional
+    include_archived=False,  # include archive/ subdirectory
+    limit=20,  # max 200
 )
 # → list of task dicts, sorted by created descending
 ```
@@ -75,10 +75,10 @@ Searches the main queue first, then `archive/`. Requires a full UUID — no pref
 ```python
 update_task(
     task_id="a7f3d2c1-1234-5678-abcd-000000000000",
-    status="in-progress",           # see transition table below
+    status="in-progress",  # see transition table below
     actor="claudebox",
     note="Claimed task, starting build.",
-    output=None,                    # written to result.output on completed/failed
+    output=None,  # written to result.output on completed/failed
 )
 # → {"ok": true, "task_id": "<uuid>"} or {"ok": false, "error": "..."}
 ```
