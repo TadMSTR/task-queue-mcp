@@ -69,6 +69,23 @@ All notable changes to this project will be documented in this file.
   a new operator-mutating tool on the same unauthenticated loopback transport, and its
   source-agent check is an integrity control over a self-asserted actor, not authentication.
 
+### Security
+- Audited before merge (`task-queue-park-amend-2026-08`): **PASS — 0 Critical/High/Medium,
+  2 Low, 10 Info**. Both Low findings confirmed and closed risks identified during the build
+  rather than surfacing new ones, and neither required a code change. Both are now recorded
+  as `SECURITY[accepted]` markers in `src/tools/queue.py`:
+  - `unpark_task_handler` resolves its target status from a read taken outside the write
+    lock. An illegal transition still cannot land — `set_task_status_handler` re-reads and
+    re-validates under the lock — so the residual race is a redundant-but-valid transition
+    plus a duplicate history entry, not a state-integrity bypass.
+  - `parked` joining the derived `NON_TERMINAL_STATUSES` set automatically admitted it as a
+    source for `update_task`'s `failed` transition, so an agent can fail a task the operator
+    parked. The underlying gap — `update_task_handler` has no `target_agent` ownership check
+    at all — is pre-existing. Tracked in vikunja#325.
+- The `amend_task` authorization model was reviewed explicitly and confirmed sound: it is an
+  integrity control over a self-asserted actor, not an authentication boundary, consistent
+  with this server's documented unauthenticated-loopback trust model.
+
 ### Tests
 - 122 tests, 91.9% coverage. New: park from each non-terminal status, park rejected from
   terminal, park unreachable via `update_task`, parked-past-TTL still listed, unpark

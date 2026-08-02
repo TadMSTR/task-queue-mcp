@@ -29,6 +29,15 @@ NON_TERMINAL_STATUSES = VALID_STATUSES - TERMINAL_STATUSES
 
 # Valid source statuses for each target transition in update_task (agent-facing, strict).
 # NB: `cancelled` is operator-only and is NOT reachable here — agents cannot cancel.
+#
+# SECURITY[accepted]: `failed` is defined in terms of NON_TERMINAL_STATUSES, so adding
+# `parked` to the vocabulary automatically admitted it here — an agent that can still see a
+# parked task via list_tasks can mark it `failed`, terminally ending a task the operator
+# deliberately paused. The other three sets are literals and did not widen (audited: only
+# `failed` is derived this way). Agents should never reach a parked task, since `in-progress`
+# is only reachable from `approved`; the underlying gap is that update_task_handler has no
+# target_agent ownership check at all, which is pre-existing and out of scope here.
+# Tracked for a real fix — see vikunja#325. (task-queue-park-amend-2026-08 audit, LOW)
 VALID_TRANSITIONS: dict[str, set[str]] = {
     "in-progress": {"approved"},  # agents must not claim unapproved tasks
     "completed": {"in-progress"},
@@ -632,6 +641,18 @@ def unpark_task_handler(
     somewhere else instead. Errors if the task is not parked, or if it carries no
     `parked_from` (a task parked before this field existed, or by a direct-YAML writer) and
     no explicit status was given.
+
+    SECURITY[accepted]: the target status is resolved from a read taken *outside* the write
+    lock, because set_task_status_handler acquires the same non-reentrant fcntl lock and
+    holding it across both would deadlock. An illegal transition still cannot land — that
+    handler re-reads `current_status` under the lock and re-validates against it. The
+    residual race is narrower: if a second operator re-parks or unparks this task between
+    our read and that call, the stale `target` can produce a redundant-but-valid transition
+    plus a duplicate history entry. An audit-trail nuisance, not a state-integrity or
+    authorization bypass. Accepted given park/unpark is a human clicking a button, not
+    concurrent automation. Closing it fully needs a reentrant lock or a
+    set_task_status_handler that accepts a pre-loaded task.
+    (task-queue-park-amend-2026-08 audit, LOW)
     """
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
