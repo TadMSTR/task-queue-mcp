@@ -1,8 +1,8 @@
 [project]
 name = "task-queue-mcp"
-version = "0.3.1"
+version = "0.4.0"
 description = "FastMCP server exposing the agent orchestration task queue as MCP tools"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "fastmcp>=3.0.0,<4.0.0",
     "pyyaml>=6.0",
@@ -13,13 +13,20 @@ dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff==0.16.0"]
 
 [build-system]
 requires = ["setuptools>=68"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
 
 [tool.ruff]
 line-length = 100
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B", "SIM"]
 
 [tool.coverage.run]
 source = ["src"]

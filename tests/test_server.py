@@ -90,14 +90,46 @@ def test_server_cancel_task(server):
     assert server.get_task(r["task_id"])["status"] == "cancelled"
 
 
-def test_server_quarantine_and_restore(server):
+def test_server_park_and_unpark(server, tmp_path):
     r = _submit(server)
-    q = server.quarantine_task(task_id=r["task_id"], actor="ted")
-    assert q["ok"] is True
-    # Hidden from list, still resolvable
-    assert server.list_tasks() == []
-    assert server.get_task(r["task_id"])["id"] == r["task_id"]
+    _set_status_on_disk(tmp_path, r["filename"], "approved")
 
-    res = server.restore_task(task_id=r["task_id"], actor="ted")
-    assert res["ok"] is True
+    p = server.park_task(task_id=r["task_id"], actor="ted")
+    assert p["ok"] is True
+    # Stays visible — the point of park-as-status.
     assert len(server.list_tasks()) == 1
+    assert server.get_task(r["task_id"])["status"] == "parked"
+
+    u = server.unpark_task(task_id=r["task_id"], actor="ted")
+    assert u["ok"] is True
+    assert server.get_task(r["task_id"])["status"] == "approved"
+
+
+def test_server_unpark_explicit_status(server):
+    r = _submit(server)
+    server.park_task(task_id=r["task_id"], actor="ted")
+    u = server.unpark_task(task_id=r["task_id"], actor="ted", status="approved")
+    assert u["ok"] is True
+    assert server.get_task(r["task_id"])["status"] == "approved"
+
+
+def test_server_amend_task(server):
+    r = _submit(server)
+    out = server.amend_task(
+        task_id=r["task_id"],
+        amendment="preflight answered the open question",
+        actor="research",
+        reason="post-queue correction",
+    )
+    assert out["ok"] is True
+    assert out["amendment_count"] == 1
+
+    task = server.get_task(r["task_id"])
+    assert task["payload"]["description"] == "d"
+    assert task["payload"]["amendments"][0]["text"] == "preflight answered the open question"
+
+
+def test_server_amend_task_target_agent_rejected(server):
+    r = _submit(server)
+    out = server.amend_task(task_id=r["task_id"], amendment="nope", actor="developer")
+    assert out["ok"] is False

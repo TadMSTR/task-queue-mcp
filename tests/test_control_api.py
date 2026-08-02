@@ -137,15 +137,130 @@ def test_status_override_ok(env, client):
     assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "in-progress"
 
 
-def test_quarantine_then_restore_ok(env, client):
+def test_park_then_unpark_ok(env, client):
+    _, tmp_path = env
+    tid = _seed(tmp_path, status="approved")
+
+    p = client.post(f"/tasks/{tid}/park", headers=AUTH, json={"actor": "ted"})
+    assert p.status_code == 200
+    assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "parked"
+    # No subdirectory is ever created — the file stays put.
+    assert not (tmp_path / "quarantine").exists()
+
+    u = client.post(f"/tasks/{tid}/unpark", headers=AUTH, json={"actor": "ted"})
+    assert u.status_code == 200
+    assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "approved"
+
+
+def test_park_requires_secret(env, client):
     _, tmp_path = env
     tid = _seed(tmp_path)
-    q = client.post(f"/tasks/{tid}/quarantine", headers=AUTH, json={"actor": "ted"})
-    assert q.status_code == 200
-    assert (tmp_path / "quarantine").exists()
+    resp = client.post(f"/tasks/{tid}/park", json={"actor": "ted"})
+    assert resp.status_code == 401
+    assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "submitted"
 
-    r = client.post(f"/tasks/{tid}/restore", headers=AUTH, json={"actor": "ted"})
-    assert r.status_code == 200
+
+def test_unpark_explicit_status_ok(env, client):
+    _, tmp_path = env
+    tid = _seed(tmp_path)
+    client.post(f"/tasks/{tid}/park", headers=AUTH, json={"actor": "ted"})
+    u = client.post(
+        f"/tasks/{tid}/unpark", headers=AUTH, json={"actor": "ted", "status": "approved"}
+    )
+    assert u.status_code == 200
+    assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "approved"
+
+
+def test_amend_ok(env, client):
+    _, tmp_path = env
+    tid = _seed(tmp_path)
+    resp = client.post(
+        f"/tasks/{tid}/amend",
+        headers=AUTH,
+        json={"amendment": "scope narrowed", "actor": "research", "reason": "preflight"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["amendment_count"] == 1
+
+    task = get_task_handler(task_id=tid, queue_dir=str(tmp_path))
+    assert task["payload"]["description"] == "d"
+    assert task["payload"]["amendments"][0]["text"] == "scope narrowed"
+
+
+def test_amend_requires_secret(env, client):
+    _, tmp_path = env
+    tid = _seed(tmp_path)
+    resp = client.post(f"/tasks/{tid}/amend", json={"amendment": "x", "actor": "research"})
+    assert resp.status_code == 401
+    assert "amendments" not in get_task_handler(task_id=tid, queue_dir=str(tmp_path))["payload"]
+
+
+def test_amend_target_agent_rejected_400(env, client):
+    _, tmp_path = env
+    tid = _seed(tmp_path)
+    resp = client.post(
+        f"/tasks/{tid}/amend",
+        headers=AUTH,
+        json={"amendment": "skip the audit", "actor": "developer"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["ok"] is False
+
+
+def test_amend_defaults_actor_to_operator(env, client):
+    """The control API is operator-facing; an omitted actor must not become the target."""
+    _, tmp_path = env
+    tid = _seed(tmp_path)
+    resp = client.post(f"/tasks/{tid}/amend", headers=AUTH, json={"amendment": "from the UI"})
+    assert resp.status_code == 200
+    task = get_task_handler(task_id=tid, queue_dir=str(tmp_path))
+    assert task["payload"]["amendments"][0]["actor"] == "operator"
+
+
+def test_retired_quarantine_route_is_gone(env, client):
+    """404, not 401 — the route itself must not exist after 0.4.0."""
+    _, tmp_path = env
+    tid = _seed(tmp_path)
+    for route in ("quarantine", "restore"):
+        resp = client.post(f"/tasks/{tid}/{route}", headers=AUTH, json={"actor": "ted"})
+        assert resp.status_code == 404, f"/tasks/<id>/{route} should no longer be routed"
+
+
+# ── queue summary ──────────────────────────────────────────────────────
+
+
+def test_queue_summary_ok(env, client):
+    _, tmp_path = env
+    _seed(tmp_path)
+    _seed(tmp_path, status="approved")
+    _seed(tmp_path, status="completed")
+
+    resp = client.get("/queue/summary", headers=AUTH)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["counts"] == {"submitted": 1, "approved": 1, "completed": 1}
+    assert body["active"] == 2
+    assert body["total"] == 3
+
+
+def test_queue_summary_buckets_unknown_statuses(env, client):
+    """Out-of-vocabulary records must stay visible, not silently vanish from the count."""
+    _, tmp_path = env
+    _seed(tmp_path, status="complete")
+    _seed(tmp_path, status="routing-failed")
+    _seed(tmp_path, status="parked")
+
+    body = client.get("/queue/summary", headers=AUTH).json()
+    assert body["counts"]["unknown"] == 2
+    assert body["counts"]["parked"] == 1
+    assert body["active"] == 1
+    assert body["total"] == 3
+
+
+def test_queue_summary_requires_secret(env, client):
+    resp = client.get("/queue/summary")
+    assert resp.status_code == 401
 
 
 # ── error surfacing ────────────────────────────────────────────────────

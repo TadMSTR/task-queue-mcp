@@ -4,7 +4,7 @@ import logging
 import os
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import yaml
 
@@ -16,6 +16,7 @@ VALID_STATUSES = {
     "approved",
     "pending-approval",
     "in-progress",
+    "parked",
     "completed",
     "failed",
     "cancelled",
@@ -41,9 +42,22 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
 OPERATOR_TRANSITIONS: dict[str, set[str]] = {
     "approved": {"submitted", "pending-approval"},
     "cancelled": NON_TERMINAL_STATUSES,  # any non-terminal task may be cancelled
+    "parked": NON_TERMINAL_STATUSES - {"parked"},  # park any non-terminal task
 }
 
-QUARANTINE_DIRNAME = "quarantine"
+# Set when a task is parked, recording the status to return to on unpark. Unparking is a
+# non-terminal → non-terminal move, so it goes through the audited allow_override path.
+PARKED_FROM_KEY = "parked_from"
+
+# amend_task bounds. More than one or two amendments on a task is a signal to cancel and
+# re-queue rather than accrete — these are a backstop, not a budget.
+MAX_AMENDMENTS = 10
+MAX_AMENDMENT_CHARS = 4096
+
+# Only the agent that queued the task, or the operator, may amend it. The *target* agent
+# must not be able to rewrite the instructions it was handed — the same trust boundary
+# that already makes `cancelled` operator-only.
+OPERATOR_ACTOR = "operator"
 
 # context_refs validation: enforce absolute paths (must start with '/').
 # Trust model: we do not restrict to a specific prefix allowlist — consumers
@@ -65,11 +79,7 @@ def _load_task_file(path: str) -> dict | None:
         return None
 
 
-def _load_all_tasks(
-    queue_dir: str,
-    include_archived: bool = False,
-    include_quarantined: bool = False,
-) -> list[dict]:
+def _load_all_tasks(queue_dir: str, include_archived: bool = False) -> list[dict]:
     """
     Load all *.yml task files from queue_dir, skipping .tmp files.
     Attaches _path to each task dict for internal use (stripped before returning to callers).
@@ -84,14 +94,8 @@ def _load_all_tasks(
             task["_path"] = path
             tasks.append(task)
 
-    subdirs = []
     if include_archived:
-        subdirs.append("archive")
-    if include_quarantined:
-        subdirs.append(QUARANTINE_DIRNAME)
-
-    for subdir in subdirs:
-        for path in glob.glob(os.path.join(queue_dir, subdir, "*.yml")):
+        for path in glob.glob(os.path.join(queue_dir, "archive", "*.yml")):
             if path.endswith(".tmp"):
                 continue
             task = _load_task_file(path)
@@ -114,7 +118,7 @@ def _write_task_atomic(path: str, data: dict) -> None:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _validate_context_refs(context_refs: list) -> str | None:
@@ -256,11 +260,6 @@ def submit_task_handler(
                 "note": "Task submitted via task-queue-mcp",
             }
         ],
-        "alert_state": {
-            "first_alerted_at": None,
-            "last_alerted_at": None,
-            "alert_count": 0,
-        },
         "retry_policy": {
             "next_retry_at": None,
             "retry_count": 0,
@@ -296,9 +295,18 @@ def list_tasks_handler(
         # TTL filter: skip tasks past their TTL. TTL enforcement is authoritative in the
         # dispatcher, but we filter here too so agents don't act on stale items if the
         # dispatcher falls behind.
+        #
+        # Parked tasks are exempt. Parking is a deliberate "pause this, I'll come back to
+        # it" — a parked task silently vanishing at TTL would defeat the entire point of
+        # the status, which exists to give long-lived bookmarks a vocabulary.
         created = task.get("created")
         ttl_days = task.get("ttl_days", 30)
-        if created and isinstance(created, datetime) and now > created + timedelta(days=ttl_days):
+        if (
+            task.get("status") != "parked"
+            and created
+            and isinstance(created, datetime)
+            and now > created + timedelta(days=ttl_days)
+        ):
             continue
 
         if target_agent and task.get("target_agent") != target_agent:
@@ -316,7 +324,7 @@ def list_tasks_handler(
         c = t.get("created")
         if isinstance(c, datetime):
             return c
-        return datetime.min.replace(tzinfo=timezone.utc)
+        return datetime.min.replace(tzinfo=UTC)
 
     filtered.sort(key=_sort_key, reverse=True)
 
@@ -332,8 +340,8 @@ def get_task_handler(task_id: str, queue_dir: str | None = None) -> dict:
     except ValueError:
         return {"ok": False, "error": "invalid task_id format"}
 
-    # Search main queue, then archive and quarantine
-    tasks = _load_all_tasks(queue_dir, include_archived=True, include_quarantined=True)
+    # Search main queue, then archive/
+    tasks = _load_all_tasks(queue_dir, include_archived=True)
     for task in tasks:
         if task.get("id") == task_id:
             return {k: v for k, v in task.items() if k != "_path"}
@@ -415,7 +423,7 @@ def update_task_handler(
             task["history"] = []
         task["history"].append(history_entry)
 
-        # alert_state and retry_policy are owned by the task-dispatcher — never modify them
+        # retry_policy is owned by the task-dispatcher — never modify it
         path = task.pop("_path")
         _write_task_atomic(path, task)
 
@@ -436,11 +444,15 @@ def set_task_status_handler(
 
       - submitted/pending-approval → approved
       - any non-terminal          → cancelled
+      - any non-terminal          → parked
       - any non-terminal → any non-terminal (only with allow_override=True; the
         deliberate "advance a missed task" override — a non-empty note is required)
+      - any *unrecognised* status → any valid status (only with allow_override=True and
+        a non-empty note; the repair path for records written outside this server)
 
-    Terminal tasks (completed/failed/cancelled) are immutable. Archived and quarantined
-    tasks cannot be mutated (restore first). Every change appends a history entry.
+    Parking records the prior status in `parked_from` so unpark_task can restore it; the
+    key is cleared on the way out. Terminal tasks (completed/failed/cancelled) are
+    immutable. Archived tasks cannot be mutated. Every change appends a history entry.
     """
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
@@ -483,13 +495,21 @@ def set_task_status_handler(
             and status in NON_TERMINAL_STATUSES
             and current_status in NON_TERMINAL_STATUSES
         )
+        # Repair path: a record whose current status is not in our vocabulary at all (e.g.
+        # `complete` vs `completed`, or the dispatcher's `routing-failed`) is unreachable by
+        # every other branch — standard_ok needs it in an OPERATOR_TRANSITIONS set and
+        # override_ok needs it in NON_TERMINAL_STATUSES. Written by a direct-YAML writer,
+        # such a task is otherwise permanently stuck. This is the narrowest unsticking that
+        # loosens no legitimate transition: it requires an explicit override plus a note,
+        # and only ever moves *out of* an invalid status.
+        repair_ok = allow_override and current_status not in VALID_STATUSES
 
-        if not (standard_ok or override_ok):
+        if not (standard_ok or override_ok or repair_ok):
             error = (
                 f"Invalid operator transition: {current_status!r} → {status!r}. "
                 f"Standard targets: approved (from submitted/pending-approval), "
-                f"cancelled (from any non-terminal). For other non-terminal moves pass "
-                f"allow_override=True."
+                f"cancelled or parked (from any non-terminal). For other non-terminal moves "
+                f"pass allow_override=True."
             )
             # If this exact transition is one the agent-facing update_task tool accepts
             # (e.g. in-progress→completed, approved→in-progress, or →failed), point the
@@ -505,7 +525,7 @@ def set_task_status_handler(
                 )
             return {"ok": False, "error": error}
 
-        if override_ok and not standard_ok and not (note and note.strip()):
+        if (override_ok or repair_ok) and not standard_ok and not (note and note.strip()):
             return {
                 "ok": False,
                 "error": "an override transition requires a non-empty note for the audit trail",
@@ -513,6 +533,14 @@ def set_task_status_handler(
 
         now = _now()
         task["status"] = status
+
+        # Parking records where to return to; leaving parked clears the marker so it can
+        # never go stale and point at a status the task is no longer in.
+        if status == "parked":
+            if current_status != "parked":
+                task[PARKED_FROM_KEY] = current_status
+        else:
+            task.pop(PARKED_FROM_KEY, None)
 
         if status in TERMINAL_STATUSES:
             if task.get("result") is None:
@@ -526,13 +554,15 @@ def set_task_status_handler(
             "actor": actor,
             "note": note,
         }
-        if override_ok and not standard_ok:
+        if (override_ok or repair_ok) and not standard_ok:
             history_entry["override"] = True
+        if repair_ok:
+            history_entry["repaired_from"] = current_status
         if task.get("history") is None:
             task["history"] = []
         task["history"].append(history_entry)
 
-        # alert_state and retry_policy are owned by the task-dispatcher — never modify them
+        # retry_policy is owned by the task-dispatcher — never modify it
         path = task.pop("_path")
         _write_task_atomic(path, task)
 
@@ -542,7 +572,7 @@ def set_task_status_handler(
         current_status,
         status,
         actor,
-        override_ok and not standard_ok,
+        (override_ok or repair_ok) and not standard_ok,
     )
     return {"ok": True, "task_id": task_id}
 
@@ -567,25 +597,97 @@ def cancel_task_handler(
     )
 
 
-def _move_task_file(src: str, dest_dir: str) -> str:
-    """Atomically move a task YAML into dest_dir (created if needed). Returns the new path."""
-    os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.join(dest_dir, os.path.basename(src))
-    os.rename(src, dest)
-    return dest
-
-
-def quarantine_task_handler(
+def park_task_handler(
     task_id: str,
     actor: str,
     note: str = "",
     queue_dir: str | None = None,
 ) -> dict:
     """
-    Isolate a task by moving its YAML to <queue_dir>/quarantine/ (recoverable, not deleted).
-    Quarantined tasks drop out of list_tasks but remain resolvable via get_task and
-    restorable via restore_task. The task's status is preserved; the action is audited
-    in history. There is intentionally no hard-delete.
+    Park a task: pause it without hiding it. The YAML stays exactly where it is and the
+    task keeps appearing in list_tasks — only its status changes, so the dispatcher's
+    pickup loops (which match `submitted` and `routing-failed`) skip it and nothing sweeps
+    it at TTL. The prior status is recorded in `parked_from` for unpark_task.
+
+    Thin wrapper over set_task_status_handler, same as cancel_task.
+    """
+    return set_task_status_handler(
+        task_id=task_id,
+        status="parked",
+        actor=actor,
+        note=note or "Parked by operator",
+        queue_dir=queue_dir,
+    )
+
+
+def unpark_task_handler(
+    task_id: str,
+    actor: str,
+    note: str = "",
+    status: str | None = None,
+    queue_dir: str | None = None,
+) -> dict:
+    """
+    Unpark a task, returning it to the status it was parked from. Pass `status` to send it
+    somewhere else instead. Errors if the task is not parked, or if it carries no
+    `parked_from` (a task parked before this field existed, or by a direct-YAML writer) and
+    no explicit status was given.
+    """
+    if queue_dir is None:
+        queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
+
+    try:
+        uuid.UUID(task_id)
+    except ValueError:
+        return {"ok": False, "error": "invalid task_id format"}
+
+    # Resolve the target before taking the write lock — set_task_status_handler acquires
+    # the same (non-reentrant) per-task lock.
+    tasks = _load_all_tasks(queue_dir, include_archived=True)
+    task = next((t for t in tasks if t.get("id") == task_id), None)
+    if task is None:
+        return {"ok": False, "error": "not found"}
+    if task.get("status") != "parked":
+        return {"ok": False, "error": f"task is not parked (status: {task.get('status')!r})"}
+
+    target = status or task.get(PARKED_FROM_KEY)
+    if not target:
+        return {
+            "ok": False,
+            "error": (
+                "task has no recorded parked_from status — pass an explicit status to "
+                f"unpark it. Valid statuses: {sorted(NON_TERMINAL_STATUSES)}"
+            ),
+        }
+
+    return set_task_status_handler(
+        task_id=task_id,
+        status=target,
+        actor=actor,
+        note=note or f"Unparked by operator (→ {target})",
+        allow_override=True,
+        queue_dir=queue_dir,
+    )
+
+
+def amend_task_handler(
+    task_id: str,
+    amendment: str,
+    actor: str,
+    reason: str = "",
+    queue_dir: str | None = None,
+) -> dict:
+    """
+    Append an amendment to a queued task. Append-only by construction: the original
+    `payload.description` is never mutated, so the record of what the task was originally
+    asked to do survives every correction.
+
+    Authorization: the task's `source_agent` or the operator. The *target* agent is
+    rejected — it must not be able to rewrite the instructions it was handed.
+
+    Amending an in-progress task is permitted (it is the case that matters most), but the
+    response carries `agent_may_have_started` so the caller knows the agent may already
+    have read the original and needs telling out of band.
     """
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
@@ -598,87 +700,100 @@ def quarantine_task_handler(
     if not actor or not actor.strip():
         return {"ok": False, "error": "actor must not be empty"}
 
+    if not amendment or not amendment.strip():
+        return {"ok": False, "error": "amendment must not be empty"}
+
+    if len(amendment) > MAX_AMENDMENT_CHARS:
+        return {
+            "ok": False,
+            "error": (
+                f"amendment is {len(amendment)} chars, over the {MAX_AMENDMENT_CHARS} limit. "
+                f"Cancel and re-queue the task rather than accreting a large correction."
+            ),
+        }
+
     with _task_lock(queue_dir, task_id):
-        tasks = _load_all_tasks(queue_dir, include_archived=True, include_quarantined=True)
+        tasks = _load_all_tasks(queue_dir, include_archived=True)
         task = next((t for t in tasks if t.get("id") == task_id), None)
 
         if task is None:
             return {"ok": False, "error": "not found"}
 
-        path = task.get("_path", "")
-        if os.sep + "archive" + os.sep in path or path.endswith(os.sep + "archive"):
-            return {"ok": False, "error": "task is archived and cannot be quarantined"}
-        if os.sep + QUARANTINE_DIRNAME + os.sep in path:
-            return {"ok": False, "error": "task is already quarantined"}
+        if "archive" in task.get("_path", ""):
+            return {"ok": False, "error": "task is archived and cannot be amended"}
+
+        current_status = task.get("status")
+        if current_status in TERMINAL_STATUSES:
+            return {
+                "ok": False,
+                "error": f"Task is in terminal status {current_status!r} and cannot be amended",
+            }
+
+        source_agent = task.get("source_agent")
+        if actor != source_agent and actor != OPERATOR_ACTOR:
+            return {
+                "ok": False,
+                "error": (
+                    f"actor {actor!r} may not amend this task. Only its source_agent "
+                    f"({source_agent!r}) or {OPERATOR_ACTOR!r} may amend — the target agent "
+                    f"must not rewrite its own instructions."
+                ),
+            }
+
+        payload = task.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+            task["payload"] = payload
+
+        amendments = payload.get("amendments")
+        if not isinstance(amendments, list):
+            amendments = []
+            payload["amendments"] = amendments
+
+        if len(amendments) >= MAX_AMENDMENTS:
+            return {
+                "ok": False,
+                "error": (
+                    f"task already has {len(amendments)} amendments (limit {MAX_AMENDMENTS}). "
+                    f"Cancel and re-queue rather than accreting further."
+                ),
+            }
 
         now = _now()
+        amendments.append(
+            {
+                "timestamp": now,
+                "actor": actor,
+                "reason": reason,
+                "text": amendment,
+            }
+        )
+
         history_entry = {
             "timestamp": now,
-            "status": task.get("status"),
+            "status": current_status,
             "actor": actor,
-            "note": note or "Quarantined by operator",
-            "action": "quarantine",
+            "note": reason or "Task amended",
+            "action": "amend",
         }
         if task.get("history") is None:
             task["history"] = []
         task["history"].append(history_entry)
 
-        task.pop("_path")
-        # Persist the history entry at the source path, then move atomically into quarantine.
+        # retry_policy is owned by the task-dispatcher — never modify it
+        path = task.pop("_path")
         _write_task_atomic(path, task)
-        dest = _move_task_file(path, os.path.join(queue_dir, QUARANTINE_DIRNAME))
 
-    logger.info("task.quarantine id=%s actor=%s -> %s", task_id[:8], actor, dest)
-    return {"ok": True, "task_id": task_id}
-
-
-def restore_task_handler(
-    task_id: str,
-    actor: str,
-    note: str = "",
-    queue_dir: str | None = None,
-) -> dict:
-    """
-    Restore a quarantined task: move its YAML back to the active queue dir and audit it.
-    Reverses quarantine_task. Errors if the task is not currently quarantined.
-    """
-    if queue_dir is None:
-        queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
-
-    try:
-        uuid.UUID(task_id)
-    except ValueError:
-        return {"ok": False, "error": "invalid task_id format"}
-
-    if not actor or not actor.strip():
-        return {"ok": False, "error": "actor must not be empty"}
-
-    with _task_lock(queue_dir, task_id):
-        tasks = _load_all_tasks(queue_dir, include_quarantined=True)
-        task = next((t for t in tasks if t.get("id") == task_id), None)
-
-        if task is None:
-            return {"ok": False, "error": "not found"}
-
-        path = task.get("_path", "")
-        if os.sep + QUARANTINE_DIRNAME + os.sep not in path:
-            return {"ok": False, "error": "task is not quarantined"}
-
-        now = _now()
-        history_entry = {
-            "timestamp": now,
-            "status": task.get("status"),
-            "actor": actor,
-            "note": note or "Restored from quarantine by operator",
-            "action": "restore",
-        }
-        if task.get("history") is None:
-            task["history"] = []
-        task["history"].append(history_entry)
-
-        task.pop("_path")
-        _write_task_atomic(path, task)
-        dest = _move_task_file(path, queue_dir)
-
-    logger.info("task.restore id=%s actor=%s -> %s", task_id[:8], actor, dest)
-    return {"ok": True, "task_id": task_id}
+    logger.info(
+        "task.amend id=%s actor=%s count=%d status=%s",
+        task_id[:8],
+        actor,
+        len(amendments),
+        current_status,
+    )
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "amendment_count": len(amendments),
+        "agent_may_have_started": current_status == "in-progress",
+    }

@@ -10,13 +10,17 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from src.tools.queue import (
+    NON_TERMINAL_STATUSES,
+    VALID_STATUSES,
+    _load_all_tasks,
+    amend_task_handler,
     cancel_task_handler,
     get_task_handler,
     list_tasks_handler,
-    quarantine_task_handler,
-    restore_task_handler,
+    park_task_handler,
     set_task_status_handler,
     submit_task_handler,
+    unpark_task_handler,
     update_task_handler,
 )
 
@@ -180,22 +184,47 @@ def cancel_task(task_id: str, actor: str, note: str = "") -> dict:
 
 
 @mcp.tool()
-def quarantine_task(task_id: str, actor: str, note: str = "") -> dict:
+def park_task(task_id: str, actor: str, note: str = "") -> dict:
     """
-    Isolate a task by moving its YAML to quarantine/ (recoverable, not deleted). It drops
-    out of list_tasks but stays resolvable via get_task and restorable via restore_task.
+    Park a task — pause it without losing sight of it. The task stays in the queue and
+    keeps appearing in list_tasks, but nothing will pick it up until it is unparked, and
+    it is exempt from TTL expiry. Use for "not now, but don't lose this". Reversible via
+    unpark_task, which returns it to the status it was parked from.
     Returns {ok, task_id} or {ok: false, error}.
     """
-    return quarantine_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
+    return park_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
 
 
 @mcp.tool()
-def restore_task(task_id: str, actor: str, note: str = "") -> dict:
+def unpark_task(task_id: str, actor: str, note: str = "", status: str | None = None) -> dict:
     """
-    Restore a quarantined task back to the active queue. Reverses quarantine_task.
+    Unpark a task, returning it to the status it was parked from. Pass status to send it
+    somewhere else instead. Reverses park_task.
     Returns {ok, task_id} or {ok: false, error}.
     """
-    return restore_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
+    return unpark_task_handler(
+        task_id=task_id, actor=actor, note=note, status=status, queue_dir=QUEUE_DIR
+    )
+
+
+@mcp.tool()
+def amend_task(task_id: str, amendment: str, actor: str, reason: str = "") -> dict:
+    """
+    Append a correction to a queued task without rewriting it. The original description is
+    never modified — amendments accumulate under payload.amendments and readers render them
+    after it. Use when something changes between queuing and starting: a preflight answers
+    an open question, a dependency lands, scope narrows.
+
+    Only the task's source_agent or "operator" may amend; the target agent may not.
+    Permitted on non-terminal tasks including in-progress ones — check
+    agent_may_have_started in the response, since the agent may already have read the
+    original. More than one or two amendments is a signal to cancel and re-queue instead.
+
+    Returns {ok, task_id, amendment_count, agent_may_have_started} or {ok: false, error}.
+    """
+    return amend_task_handler(
+        task_id=task_id, amendment=amendment, actor=actor, reason=reason, queue_dir=QUEUE_DIR
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -297,12 +326,12 @@ async def http_set_status(request: Request) -> JSONResponse:
     return _control_response(result)
 
 
-@mcp.custom_route("/tasks/{task_id}/quarantine", methods=["POST"])
-async def http_quarantine(request: Request) -> JSONResponse:
+@mcp.custom_route("/tasks/{task_id}/park", methods=["POST"])
+async def http_park(request: Request) -> JSONResponse:
     if not _authorized(request):
         return _unauthorized()
     body = await _json_body(request)
-    result = quarantine_task_handler(
+    result = park_task_handler(
         task_id=request.path_params["task_id"],
         actor=body.get("actor", "operator"),
         note=body.get("note", ""),
@@ -311,18 +340,61 @@ async def http_quarantine(request: Request) -> JSONResponse:
     return _control_response(result)
 
 
-@mcp.custom_route("/tasks/{task_id}/restore", methods=["POST"])
-async def http_restore(request: Request) -> JSONResponse:
+@mcp.custom_route("/tasks/{task_id}/unpark", methods=["POST"])
+async def http_unpark(request: Request) -> JSONResponse:
     if not _authorized(request):
         return _unauthorized()
     body = await _json_body(request)
-    result = restore_task_handler(
+    result = unpark_task_handler(
         task_id=request.path_params["task_id"],
         actor=body.get("actor", "operator"),
         note=body.get("note", ""),
+        status=body.get("status"),
         queue_dir=QUEUE_DIR,
     )
     return _control_response(result)
+
+
+@mcp.custom_route("/tasks/{task_id}/amend", methods=["POST"])
+async def http_amend(request: Request) -> JSONResponse:
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = amend_task_handler(
+        task_id=request.path_params["task_id"],
+        amendment=body.get("amendment", ""),
+        actor=body.get("actor", "operator"),
+        reason=body.get("reason", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
+@mcp.custom_route("/queue/summary", methods=["GET"])
+async def http_queue_summary(request: Request) -> JSONResponse:
+    """
+    Counts by status across the active queue. Statuses outside VALID_STATUSES are bucketed
+    under "unknown" rather than dropped, so records written by other direct-YAML writers
+    (the dispatcher's `routing-failed`, or historic typos) stay visible.
+    """
+    if not _authorized(request):
+        return _unauthorized()
+
+    counts: dict[str, int] = {}
+    unknown = 0
+    for task in _load_all_tasks(QUEUE_DIR):
+        status = task.get("status")
+        if status in VALID_STATUSES:
+            counts[status] = counts.get(status, 0) + 1
+        else:
+            unknown += 1
+    if unknown:
+        counts["unknown"] = unknown
+
+    active = sum(n for s, n in counts.items() if s in NON_TERMINAL_STATUSES)
+    return JSONResponse(
+        {"ok": True, "counts": counts, "active": active, "total": sum(counts.values())}
+    )
 
 
 if __name__ == "__main__":
