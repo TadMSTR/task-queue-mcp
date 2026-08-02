@@ -1,17 +1,20 @@
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import yaml
 
 from src.tools.queue import (
+    MAX_AMENDMENT_CHARS,
+    MAX_AMENDMENTS,
+    amend_task_handler,
     cancel_task_handler,
     get_task_handler,
     list_tasks_handler,
-    quarantine_task_handler,
-    restore_task_handler,
+    park_task_handler,
     set_task_status_handler,
     submit_task_handler,
+    unpark_task_handler,
     update_task_handler,
 )
 
@@ -68,8 +71,10 @@ def test_submit_creates_file(tmp_path):
     assert data["target_agent"] == "dev"
     assert len(data["history"]) == 1
     assert data["history"][0]["status"] == "submitted"
-    assert data["alert_state"]["alert_count"] == 0
     assert data["retry_policy"]["retry_count"] == 0
+    # alert_state was retired in 0.4.0 — the emitter is gone, so we no longer write a
+    # block nothing reads. Existing YAMLs keep theirs; it is inert.
+    assert "alert_state" not in data
 
 
 def test_submit_adversarial_strings(tmp_path):
@@ -272,7 +277,7 @@ def test_list_include_archived(tmp_path):
     archive_dir.mkdir()
     archived = {
         "id": str(uuid.uuid4()),
-        "created": datetime.now(timezone.utc),
+        "created": datetime.now(UTC),
         "source_agent": "test",
         "target_agent": "dev",
         "task_type": "build",
@@ -299,7 +304,7 @@ def test_list_excludes_expired_tasks(tmp_path):
     path = str(tmp_path / result["filename"])
     with open(path) as f:
         data = yaml.safe_load(f)
-    data["created"] = datetime.now(timezone.utc) - timedelta(days=2)
+    data["created"] = datetime.now(UTC) - timedelta(days=2)
     with open(path, "w") as f:
         yaml.dump(data, f)
 
@@ -411,8 +416,12 @@ def test_update_illegal_backwards(tmp_path):
     assert unchanged["status"] == "completed"
 
 
-def test_update_preserves_alert_state(tmp_path):
-    """update_task must never touch alert_state or retry_policy."""
+def test_update_preserves_legacy_alert_state(tmp_path):
+    """
+    update_task must never touch retry_policy, nor the residual alert_state block on
+    pre-0.4.0 task files. We stopped writing alert_state on create, but the 376 YAMLs that
+    already carry one are left as-is — a mutation must not silently strip them.
+    """
     result = make_task(tmp_path)
     path = str(tmp_path / result["filename"])
 
@@ -895,98 +904,490 @@ def test_cancel_task_custom_note(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# quarantine / restore tests
+# park / unpark tests
 # ---------------------------------------------------------------------------
 
 
-def test_quarantine_moves_file_and_hides_from_list(tmp_path):
+def test_park_keeps_file_in_place_and_visible(tmp_path):
+    """The whole point of park-as-status: the task stays exactly where it was."""
     result = make_task(tmp_path)
-    r = quarantine_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    r = park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
     assert r["ok"] is True
 
-    # File moved into quarantine/
-    assert not (tmp_path / result["filename"]).exists()
-    assert (tmp_path / "quarantine" / result["filename"]).exists()
+    # File never moves — no subdirectory involved.
+    assert (tmp_path / result["filename"]).exists()
 
-    # Hidden from list_tasks (even with include_archived)
-    assert len(list_tasks_handler(queue_dir=str(tmp_path))) == 0
-    assert len(list_tasks_handler(include_archived=True, queue_dir=str(tmp_path))) == 0
+    # Still listed. This is what quarantine got wrong.
+    listed = list_tasks_handler(queue_dir=str(tmp_path))
+    assert len(listed) == 1
+    assert listed[0]["status"] == "parked"
 
-    # Still resolvable via get_task, with an audited history entry
     task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
-    assert task["id"] == result["task_id"]
-    assert task["history"][-1]["action"] == "quarantine"
+    assert task["parked_from"] == "submitted"
+    assert task["history"][-1]["status"] == "parked"
 
 
-def test_quarantine_already_quarantined_rejected(tmp_path):
+def test_park_from_each_non_terminal_status(tmp_path):
+    for status in ("submitted", "pending-approval", "approved", "in-progress"):
+        result = make_task(tmp_path)
+        set_task_status(tmp_path, result, status)
+        r = park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+        assert r["ok"] is True, f"park from {status} should be permitted"
+        task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+        assert task["status"] == "parked"
+        assert task["parked_from"] == status
+
+
+def test_park_from_terminal_rejected(tmp_path):
+    for status in ("completed", "failed", "cancelled"):
+        result = make_task(tmp_path)
+        set_task_status(tmp_path, result, status)
+        r = park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+        assert r["ok"] is False, f"park from {status} must be rejected"
+        assert "terminal" in r["error"]
+
+
+def test_park_is_not_reachable_via_update_task(tmp_path):
+    """Parking is an operator action, like cancel. Agents must not reach it."""
     result = make_task(tmp_path)
-    quarantine_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
-    r = quarantine_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    set_task_status(tmp_path, result, "approved")
+    r = update_task_handler(
+        task_id=result["task_id"],
+        status="parked",
+        actor="dev",
+        queue_dir=str(tmp_path),
+    )
     assert r["ok"] is False
-    assert "already quarantined" in r["error"]
+    assert "update_task accepts" in r["error"]
 
 
-def test_quarantine_archived_rejected(tmp_path):
+def test_parked_task_survives_its_ttl(tmp_path):
+    """
+    A parked task past its TTL must still be listed. Parking is a deliberate bookmark; if
+    it silently expired, the status would be actively worse than leaving the task alone.
+    """
+    result = make_task(tmp_path, ttl_days=1)
+    path = tmp_path / result["filename"]
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    data["created"] = datetime.now(UTC) - timedelta(days=30)
+    with open(path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+    # Unparked, it expires out of the listing.
+    assert len(list_tasks_handler(queue_dir=str(tmp_path))) == 0
+
+    park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+
+    listed = list_tasks_handler(queue_dir=str(tmp_path))
+    assert len(listed) == 1
+    assert listed[0]["status"] == "parked"
+
+
+def test_unpark_restores_prior_status(tmp_path):
     result = make_task(tmp_path)
-    archive_dir = tmp_path / "archive"
-    archive_dir.mkdir()
-    (tmp_path / result["filename"]).rename(archive_dir / result["filename"])
-    r = quarantine_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    set_task_status(tmp_path, result, "approved")
+    park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+
+    r = unpark_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    assert r["ok"] is True
+
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["status"] == "approved"
+    # The marker is cleared so it can never go stale.
+    assert "parked_from" not in task
+    assert task["history"][-1]["override"] is True
+
+
+def test_unpark_to_explicit_status(tmp_path):
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "approved")
+    park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+
+    r = unpark_task_handler(
+        task_id=result["task_id"],
+        actor="ted",
+        status="submitted",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is True
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["status"] == "submitted"
+
+
+def test_unpark_records_a_note(tmp_path):
+    """Unpark is an override transition, which the handler requires a note for."""
+    result = make_task(tmp_path)
+    park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    unpark_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["history"][-1]["note"].strip()
+
+
+def test_unpark_not_parked_rejected(tmp_path):
+    result = make_task(tmp_path)
+    r = unpark_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    assert r["ok"] is False
+    assert "not parked" in r["error"]
+
+
+def test_unpark_without_parked_from_requires_explicit_status(tmp_path):
+    """A task parked by a direct-YAML writer carries no marker — don't guess."""
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "parked")
+
+    r = unpark_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    assert r["ok"] is False
+    assert "parked_from" in r["error"]
+
+    r = unpark_task_handler(
+        task_id=result["task_id"],
+        actor="ted",
+        status="approved",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is True
+
+
+def test_unpark_not_found(tmp_path):
+    r = unpark_task_handler(task_id=str(uuid.uuid4()), actor="ted", queue_dir=str(tmp_path))
+    assert r["ok"] is False
+    assert r["error"] == "not found"
+
+
+def test_unpark_invalid_uuid(tmp_path):
+    r = unpark_task_handler(task_id="nope", actor="ted", queue_dir=str(tmp_path))
+    assert r["ok"] is False
+    assert "invalid task_id" in r["error"]
+
+
+def test_parked_task_may_still_be_cancelled(tmp_path):
+    result = make_task(tmp_path)
+    park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    r = cancel_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    assert r["ok"] is True
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["status"] == "cancelled"
+    assert "parked_from" not in task
+
+
+# ---------------------------------------------------------------------------
+# amend_task tests
+# ---------------------------------------------------------------------------
+
+
+def test_amend_appends_and_preserves_description(tmp_path):
+    result = make_task(tmp_path, description="Original instructions")
+    r = amend_task_handler(
+        task_id=result["task_id"],
+        amendment="Preflight answered the open question: yes.",
+        actor="test-agent",
+        reason="preflight ran after queuing",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is True
+    assert r["amendment_count"] == 1
+    assert r["agent_may_have_started"] is False
+
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["payload"]["description"] == "Original instructions"
+    amendments = task["payload"]["amendments"]
+    assert len(amendments) == 1
+    assert amendments[0]["text"] == "Preflight answered the open question: yes."
+    assert amendments[0]["actor"] == "test-agent"
+    assert amendments[0]["reason"] == "preflight ran after queuing"
+    assert task["history"][-1]["action"] == "amend"
+
+
+def test_amend_second_appends_rather_than_replaces(tmp_path):
+    result = make_task(tmp_path)
+    amend_task_handler(
+        task_id=result["task_id"], amendment="first", actor="test-agent", queue_dir=str(tmp_path)
+    )
+    r = amend_task_handler(
+        task_id=result["task_id"], amendment="second", actor="test-agent", queue_dir=str(tmp_path)
+    )
+    assert r["amendment_count"] == 2
+
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    texts = [a["text"] for a in task["payload"]["amendments"]]
+    assert texts == ["first", "second"]
+
+
+def test_amend_target_agent_rejected(tmp_path):
+    """The trust boundary: the agent doing the work must not rewrite its own brief."""
+    result = make_task(tmp_path, source_agent="research", target_agent="developer")
+    r = amend_task_handler(
+        task_id=result["task_id"],
+        amendment="actually, skip the security audit",
+        actor="developer",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is False
+    assert "may not amend" in r["error"]
+    assert "research" in r["error"]
+
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert "amendments" not in task["payload"]
+
+
+def test_amend_source_agent_accepted(tmp_path):
+    result = make_task(tmp_path, source_agent="research", target_agent="developer")
+    r = amend_task_handler(
+        task_id=result["task_id"],
+        amendment="scope narrowed",
+        actor="research",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is True
+
+
+def test_amend_operator_accepted(tmp_path):
+    result = make_task(tmp_path, source_agent="research", target_agent="developer")
+    r = amend_task_handler(
+        task_id=result["task_id"],
+        amendment="scope narrowed",
+        actor="operator",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is True
+
+
+def test_amend_unrelated_agent_rejected(tmp_path):
+    result = make_task(tmp_path, source_agent="research", target_agent="developer")
+    r = amend_task_handler(
+        task_id=result["task_id"], amendment="hello", actor="sysadmin", queue_dir=str(tmp_path)
+    )
+    assert r["ok"] is False
+    assert "may not amend" in r["error"]
+
+
+def test_amend_in_progress_flags_agent_may_have_started(tmp_path):
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "in-progress")
+    r = amend_task_handler(
+        task_id=result["task_id"],
+        amendment="correction",
+        actor="test-agent",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is True
+    assert r["agent_may_have_started"] is True
+
+
+def test_amend_terminal_rejected(tmp_path):
+    for status in ("completed", "failed", "cancelled"):
+        result = make_task(tmp_path)
+        set_task_status(tmp_path, result, status)
+        r = amend_task_handler(
+            task_id=result["task_id"],
+            amendment="too late",
+            actor="test-agent",
+            queue_dir=str(tmp_path),
+        )
+        assert r["ok"] is False
+        assert "terminal" in r["error"]
+
+
+def test_amend_archived_rejected(tmp_path):
+    result = make_task(tmp_path)
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    (tmp_path / result["filename"]).rename(archive / result["filename"])
+
+    r = amend_task_handler(
+        task_id=result["task_id"], amendment="too late", actor="test-agent", queue_dir=str(tmp_path)
+    )
     assert r["ok"] is False
     assert "archived" in r["error"]
 
 
-def test_quarantine_not_found(tmp_path):
-    r = quarantine_task_handler(task_id=str(uuid.uuid4()), actor="ted", queue_dir=str(tmp_path))
-    assert r["ok"] is False
-    assert r["error"] == "not found"
-
-
-def test_quarantine_invalid_uuid(tmp_path):
-    r = quarantine_task_handler(task_id="nope", actor="ted", queue_dir=str(tmp_path))
-    assert r["ok"] is False
-    assert "invalid task_id" in r["error"]
-
-
-def test_quarantine_empty_actor_rejected(tmp_path):
+def test_amend_over_count_limit_rejected(tmp_path):
     result = make_task(tmp_path)
-    r = quarantine_task_handler(task_id=result["task_id"], actor="", queue_dir=str(tmp_path))
+    for i in range(MAX_AMENDMENTS):
+        r = amend_task_handler(
+            task_id=result["task_id"],
+            amendment=f"amendment {i}",
+            actor="test-agent",
+            queue_dir=str(tmp_path),
+        )
+        assert r["ok"] is True
+
+    r = amend_task_handler(
+        task_id=result["task_id"],
+        amendment="one too many",
+        actor="test-agent",
+        queue_dir=str(tmp_path),
+    )
     assert r["ok"] is False
-    assert "actor" in r["error"]
+    assert "re-queue" in r["error"]
 
 
-def test_restore_round_trip(tmp_path):
+def test_amend_oversized_rejected(tmp_path):
     result = make_task(tmp_path)
-    quarantine_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    r = amend_task_handler(
+        task_id=result["task_id"],
+        amendment="x" * (MAX_AMENDMENT_CHARS + 1),
+        actor="test-agent",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is False
+    assert "re-queue" in r["error"]
 
-    r = restore_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    r = amend_task_handler(
+        task_id=result["task_id"],
+        amendment="x" * MAX_AMENDMENT_CHARS,
+        actor="test-agent",
+        queue_dir=str(tmp_path),
+    )
     assert r["ok"] is True
 
-    # Back in the active queue dir and visible in list_tasks again
-    assert (tmp_path / result["filename"]).exists()
-    assert not (tmp_path / "quarantine" / result["filename"]).exists()
-    listed = list_tasks_handler(queue_dir=str(tmp_path))
-    assert len(listed) == 1
-    assert listed[0]["id"] == result["task_id"]
 
-    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
-    assert task["history"][-1]["action"] == "restore"
-
-
-def test_restore_not_quarantined_rejected(tmp_path):
+def test_amend_empty_rejected(tmp_path):
     result = make_task(tmp_path)
-    r = restore_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    for bad in ("", "   "):
+        r = amend_task_handler(
+            task_id=result["task_id"], amendment=bad, actor="test-agent", queue_dir=str(tmp_path)
+        )
+        assert r["ok"] is False
+        assert "must not be empty" in r["error"]
+
+
+def test_amend_empty_actor_rejected(tmp_path):
+    result = make_task(tmp_path)
+    r = amend_task_handler(
+        task_id=result["task_id"], amendment="text", actor="", queue_dir=str(tmp_path)
+    )
     assert r["ok"] is False
-    assert "not quarantined" in r["error"]
+    assert "actor must not be empty" in r["error"]
 
 
-def test_restore_not_found(tmp_path):
-    r = restore_task_handler(task_id=str(uuid.uuid4()), actor="ted", queue_dir=str(tmp_path))
+def test_amend_not_found(tmp_path):
+    r = amend_task_handler(
+        task_id=str(uuid.uuid4()), amendment="text", actor="test-agent", queue_dir=str(tmp_path)
+    )
     assert r["ok"] is False
     assert r["error"] == "not found"
 
 
-def test_restore_invalid_uuid(tmp_path):
-    r = restore_task_handler(task_id="nope", actor="ted", queue_dir=str(tmp_path))
+def test_amend_invalid_uuid(tmp_path):
+    r = amend_task_handler(
+        task_id="nope", amendment="text", actor="test-agent", queue_dir=str(tmp_path)
+    )
     assert r["ok"] is False
     assert "invalid task_id" in r["error"]
+
+
+def test_amend_adversarial_text_is_escaped(tmp_path):
+    """Amendment text is caller-supplied — it must round-trip through yaml.dump intact."""
+    result = make_task(tmp_path)
+    nasty = "evil: injected\n  nested: true\ncolons: {key: val}\n- item"
+    amend_task_handler(
+        task_id=result["task_id"], amendment=nasty, actor="test-agent", queue_dir=str(tmp_path)
+    )
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["payload"]["amendments"][0]["text"] == nasty
+
+
+def test_amend_preserves_parked_status(tmp_path):
+    """Parked is non-terminal, so a parked task can still be corrected before it resumes."""
+    result = make_task(tmp_path)
+    park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    r = amend_task_handler(
+        task_id=result["task_id"],
+        amendment="note for later",
+        actor="test-agent",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is True
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["status"] == "parked"
+    assert task["parked_from"] == "submitted"
+
+
+# ---------------------------------------------------------------------------
+# out-of-vocabulary status repair (1g)
+# ---------------------------------------------------------------------------
+
+
+def test_bogus_status_rejected_without_override(tmp_path):
+    """Two real tasks on disk carry `complete` (not `completed`), written direct-to-YAML."""
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "complete")
+
+    r = set_task_status_handler(
+        task_id=result["task_id"], status="completed", actor="ted", queue_dir=str(tmp_path)
+    )
+    assert r["ok"] is False
+    assert "Invalid operator transition" in r["error"]
+
+
+def test_bogus_status_repaired_with_override_and_note(tmp_path):
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "complete")
+
+    r = set_task_status_handler(
+        task_id=result["task_id"],
+        status="completed",
+        actor="ted",
+        note="repairing out-of-vocabulary status written direct-to-YAML",
+        allow_override=True,
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is True
+
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["status"] == "completed"
+    assert task["history"][-1]["override"] is True
+    assert task["history"][-1]["repaired_from"] == "complete"
+
+
+def test_bogus_status_repair_requires_a_note(tmp_path):
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "complete")
+
+    r = set_task_status_handler(
+        task_id=result["task_id"],
+        status="completed",
+        actor="ted",
+        allow_override=True,
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is False
+    assert "non-empty note" in r["error"]
+
+
+def test_routing_failed_is_repairable(tmp_path):
+    """The dispatcher writes `routing-failed`, which is outside VALID_STATUSES."""
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "routing-failed")
+
+    r = set_task_status_handler(
+        task_id=result["task_id"],
+        status="submitted",
+        actor="ted",
+        note="re-queue after dispatcher routing failure",
+        allow_override=True,
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is True
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["status"] == "submitted"
+
+
+def test_repair_target_must_be_a_valid_status(tmp_path):
+    """Repair moves *out of* an invalid status — it must not let a new one in."""
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "complete")
+
+    r = set_task_status_handler(
+        task_id=result["task_id"],
+        status="also-bogus",
+        actor="ted",
+        note="should not work",
+        allow_override=True,
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is False
+    assert "Invalid status" in r["error"]

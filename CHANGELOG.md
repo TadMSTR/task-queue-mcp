@@ -4,6 +4,98 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-02
+
+### Added
+- **`parked` status** — pause a task without losing sight of it. Non-terminal, operator-only,
+  reversible. New `park_task` / `unpark_task` tools and `POST /tasks/{id}/{park,unpark}`
+  control routes. The prior status is recorded in `parked_from` and cleared on unpark, so
+  `unpark_task` restores it without the caller having to know it; pass an explicit `status`
+  to override, or to unpark a task that carries no marker.
+- **Parked tasks are exempt from the TTL filter** in `list_tasks`. Parking is a deliberate
+  bookmark — a parked task silently expiring out of the listing would defeat the point.
+- **`amend_task`** — append-only corrections for queued tasks. Amendments accumulate under
+  `payload.amendments` as `{timestamp, actor, reason, text}`; `payload.description` is never
+  mutated. Permitted on any non-terminal task including `in-progress`, where the response
+  sets `agent_may_have_started`. Only the task's `source_agent` or `operator` may amend —
+  the target agent is rejected, so an agent cannot rewrite the instructions it was handed.
+  Bounded at 10 amendments and 4096 chars each. Control route `POST /tasks/{id}/amend`.
+- **`GET /queue/summary`** — counts by status across the active queue, behind the same
+  shared-secret gate as the mutation routes. Statuses outside `VALID_STATUSES` are bucketed
+  under `unknown` rather than dropped, so records from other direct-YAML writers stay visible.
+- **Repair path for out-of-vocabulary statuses.** `set_task_status` now accepts a transition
+  out of a status it does not recognise, given `allow_override=True` and a non-empty note.
+  Two tasks on disk carried `complete` (not `completed`), written direct-to-YAML in May, and
+  were unreachable by every mutation path — no tool could move them. The history entry
+  records `repaired_from`. Only ever moves *out of* an invalid status; the target must be valid.
+
+### Removed
+- **`quarantine_task` / `restore_task`**, the `quarantine/` subdirectory, the
+  `include_quarantined` loader parameter, and the `POST /tasks/{id}/{quarantine,restore}`
+  routes. Superseded by `parked`. Quarantine moved a task's YAML into a subdirectory that no
+  reader listed, so a quarantined task vanished from the only interface that showed it — and
+  the confirm dialog promised a restore the UI never implemented. Making park a *status*
+  dissolves that problem instead of requiring a second feature to patch it. Removed with no
+  migration or compat shim: the mechanism was never used, `quarantine/` never existed on
+  disk, no task ever carried `status: quarantined`, and no agent manifest granted either tool.
+- **`alert_state`** is no longer initialised on task creation. The emitter was removed in
+  July and nothing has read the block since. Existing task files keep theirs — the field is
+  inert, and rewriting hundreds of YAMLs to strip a no-op buys nothing. This is deliberate,
+  not an oversight; mutations preserve the residual block rather than silently dropping it.
+
+### Fixed
+- **`build-backend` was invalid.** `pyproject.toml` declared
+  `setuptools.backends.legacy:build`, which is not a real backend, so both
+  `pip install -e .` and `pip install .` failed with `BackendUnavailable` — including the
+  `pip install -e ".[dev]"` that `AGENTS.md` documents as the test setup. Runtime was never
+  affected (the image installs from `requirements.txt`), which is precisely why it went
+  unnoticed: CI installed from `requirements.txt` too, so nothing ever built the package.
+- README documented a **weaker port bind than production runs** — the compose example
+  published `8485:8485` (all interfaces) while the same document's Security section states
+  the port is loopback-limited and that any process with loopback access can mutate the queue
+  without the secret. Copying it verbatim exposed an unauthenticated mutation endpoint to the
+  LAN. Now `127.0.0.1:8485:8485`, with the reason stated inline.
+
+### Changed
+- CI installs via `pip install -e ".[dev]"` instead of `requirements.txt`, so packaging
+  breakage fails CI in future. Python matrix narrowed to 3.11/3.12/3.13 and
+  `requires-python` raised to `>=3.11`, aligning CI, `pyproject.toml`, the Dockerfile (3.12)
+  and the fleet standard, which previously disagreed with each other three ways.
+- Pinned `target-version = "py311"` for ruff and added the standard `tests/**` per-file
+  ignores, closing the fleet ruff drift. This surfaced `UP017` (`datetime.UTC`), now applied.
+- README sanitized for a public audience: hardcoded home paths, host-specific env-file
+  locations and network names genericized. Documented the `parked`, `amend_task`, repair-path
+  and `/queue/summary` behaviour, and added `amend_task` to the trust-model tool list — it is
+  a new operator-mutating tool on the same unauthenticated loopback transport, and its
+  source-agent check is an integrity control over a self-asserted actor, not authentication.
+
+### Security
+- Audited before merge (`task-queue-park-amend-2026-08`): **PASS — 0 Critical/High/Medium,
+  2 Low, 10 Info**. Both Low findings confirmed and closed risks identified during the build
+  rather than surfacing new ones, and neither required a code change. Both are now recorded
+  as `SECURITY[accepted]` markers in `src/tools/queue.py`:
+  - `unpark_task_handler` resolves its target status from a read taken outside the write
+    lock. An illegal transition still cannot land — `set_task_status_handler` re-reads and
+    re-validates under the lock — so the residual race is a redundant-but-valid transition
+    plus a duplicate history entry, not a state-integrity bypass.
+  - `parked` joining the derived `NON_TERMINAL_STATUSES` set automatically admitted it as a
+    source for `update_task`'s `failed` transition, so an agent can fail a task the operator
+    parked. The underlying gap — `update_task_handler` has no `target_agent` ownership check
+    at all — is pre-existing. Tracked in vikunja#325.
+- The `amend_task` authorization model was reviewed explicitly and confirmed sound: it is an
+  integrity control over a self-asserted actor, not an authentication boundary, consistent
+  with this server's documented unauthenticated-loopback trust model.
+
+### Tests
+- 122 tests, 91.9% coverage. New: park from each non-terminal status, park rejected from
+  terminal, park unreachable via `update_task`, parked-past-TTL still listed, unpark
+  round-trip and explicit-status unpark, unpark without a marker, parked task still
+  cancellable; `amend_task` authorization (source accepted, operator accepted, target
+  rejected, unrelated agent rejected), append-not-replace, both bounds, adversarial YAML in
+  amendment text, terminal/archived rejection; repair path with and without override/note,
+  `routing-failed` repair, and rejection of an invalid repair *target*; `/queue/summary`
+  including the `unknown` bucket; and 404s proving the retired quarantine routes are gone.
+
 ## [0.3.1] - 2026-07-20
 
 ### Changed

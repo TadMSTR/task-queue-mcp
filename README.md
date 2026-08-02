@@ -13,43 +13,45 @@ Runs as a Docker container on port 8485. Wired globally into `~/.claude.json` so
 |------|-------------|
 | `submit_task` | Create a new task with `status: submitted` |
 | `list_tasks` | List tasks with optional filters; TTL-expired tasks excluded |
-| `get_task` | Retrieve a single task by UUID (resolves archived + quarantined) |
+| `get_task` | Retrieve a single task by UUID (resolves archived tasks too) |
 | `update_task` | Agent-facing status transition (strict); appends a history entry |
-| `set_task_status` | Operator status change — approve, cancel, or advance a missed task (audited override) |
+| `set_task_status` | Operator status change — approve, cancel, park, or advance a missed task (audited override) |
 | `cancel_task` | Graceful terminal `cancelled` state for stale tasks (record kept, never deleted) |
-| `quarantine_task` | Isolate a task to `quarantine/` (recoverable); drops from `list_tasks` |
-| `restore_task` | Restore a quarantined task to the active queue |
+| `park_task` | Pause a task without hiding it — stays listed, exempt from TTL, nothing picks it up |
+| `unpark_task` | Return a parked task to the status it was parked from |
+| `amend_task` | Append a correction to a queued task; the original description is never rewritten |
 
 Agents use the strict `update_task` path; operators (via the HTTP control API) use
-`set_task_status` / `cancel_task` / `quarantine_task` / `restore_task`. Agents cannot
-cancel — `cancelled` is operator-only.
+`set_task_status` / `cancel_task` / `park_task` / `unpark_task`. Agents cannot cancel or
+park — both are operator-only. `amend_task` is the exception: the task's *source* agent may
+amend it, but the target agent may not.
 
 ### submit_task
 
 ```python
 submit_task(
     source_agent="research",
-    target_agent="claudebox",  # agent name or "auto" for dispatcher routing
+    target_agent="deploy-agent",  # agent name or "auto" for dispatcher routing
     task_type="build",  # build | deploy | fix | research | review | audit | notify
     summary="Deploy qmd update",
     description="Apply the qmd stack update from build plan...",
     risk_level="low",  # low | medium | high (default: low)
     requires_approval=False,  # explicit override of approval gate
     priority="normal",  # normal | high | urgent (default: normal)
-    context_refs=["/home/ted/.claude/projects/research/build-plans/qmd/plan.md"],
+    context_refs=["/srv/agents/build-plans/qmd/plan.md"],  # absolute paths only
     ttl_days=30,
     workflow_mode="semi-auto",  # semi-auto | auto (default: semi-auto)
 )
 # → {"ok": true, "task_id": "<uuid>", "filename": "<timestamp>-<slug>.yml"}
 ```
 
-`context_refs` must be absolute paths. `risk_level` and `priority` are validated against allowlists. `workflow_mode` controls dispatcher behavior: `semi-auto` (default) queues the task for operator pickup with a Matrix notification, while `auto` triggers the dispatcher to launch the target agent headlessly. The server generates the UUID, sets `created`, and initializes `alert_state` and `retry_policy` stubs.
+`context_refs` must be absolute paths. `risk_level` and `priority` are validated against allowlists. `workflow_mode` controls dispatcher behavior: `semi-auto` (default) queues the task for operator pickup with a Matrix notification, while `auto` triggers the dispatcher to launch the target agent headlessly. The server generates the UUID, sets `created`, and initializes the `retry_policy` stub.
 
 ### list_tasks
 
 ```python
 list_tasks(
-    target_agent="claudebox",  # optional
+    target_agent="deploy-agent",  # optional
     source_agent="research",  # optional
     status="approved,in-progress",  # comma-separated, optional
     task_type="build",  # optional
@@ -60,6 +62,8 @@ list_tasks(
 ```
 
 Tasks past their `ttl_days` are excluded. The dispatcher is authoritative for TTL archiving, but `list_tasks` filters them out proactively so agents don't act on stale items.
+
+**Parked tasks are exempt from the TTL filter.** Parking is a deliberate "pause this, I'll come back to it" — a parked task quietly expiring out of the listing would defeat the point of the status.
 
 ### get_task
 
@@ -76,7 +80,7 @@ Searches the main queue first, then `archive/`. Requires a full UUID — no pref
 update_task(
     task_id="a7f3d2c1-1234-5678-abcd-000000000000",
     status="in-progress",  # see transition table below
-    actor="claudebox",
+    actor="deploy-agent",
     note="Claimed task, starting build.",
     output=None,  # written to result.output on completed/failed
 )
@@ -91,10 +95,10 @@ update_task(
 | `in-progress` | `completed` |
 | Any non-terminal | `failed` |
 
-Non-terminal: `submitted`, `pending-approval`, `approved`, `in-progress`.
+Non-terminal: `submitted`, `pending-approval`, `approved`, `in-progress`, `parked`.
 Terminal: `completed`, `failed`, `cancelled`.
 
-`alert_state` and `retry_policy` are dispatcher-owned — `update_task` never touches them.
+`retry_policy` is dispatcher-owned — `update_task` never touches it.
 
 ### Operator transitions (`set_task_status`)
 
@@ -104,9 +108,52 @@ Broader than `update_task` but still audited and bounded:
 |------|----|-------|
 | `submitted` / `pending-approval` | `approved` | standard |
 | Any non-terminal | `cancelled` | standard (also via `cancel_task`) |
+| Any non-terminal | `parked` | standard (also via `park_task`) |
 | Any non-terminal | Any non-terminal | requires `allow_override=True` + a non-empty note (the "advance a missed task" override) |
+| Any *unrecognised* status | Any valid status | requires `allow_override=True` + a non-empty note (the repair path) |
 
 Terminal tasks are immutable even for operators. Every operator change appends a history entry with `actor` + `note`.
+
+**The repair path** exists because the queue directory has more than one writer. A record whose status is outside this server's vocabulary — a dispatcher-written `routing-failed`, or a historic `complete` typo — is unreachable by every other branch and would otherwise be permanently stuck. Repair only ever moves a task *out of* an invalid status; the target must still be valid, and the history entry records `repaired_from`.
+
+### park_task / unpark_task
+
+```python
+park_task(task_id="...", actor="operator", note="waiting on upstream fix")
+# → {"ok": true, "task_id": "<uuid>"}
+
+unpark_task(task_id="...", actor="operator", status=None)
+# → returns the task to the status it was parked from
+```
+
+Parking changes only the status — the YAML never moves. The task keeps appearing in `list_tasks`, is exempt from TTL expiry, and nothing picks it up, because the dispatcher's pickup loops match `submitted` and `routing-failed` only. The prior status is recorded in `parked_from` and cleared on the way out, so it can never go stale. Pass `status` to `unpark_task` to send the task somewhere other than where it came from — required for a task parked by a direct-YAML writer, which carries no `parked_from`.
+
+Park is for "not now, but don't lose this". A long-idle task is not necessarily neglect, and `parked` is the vocabulary that distinguishes a deliberate bookmark from something genuinely abandoned.
+
+### amend_task
+
+```python
+amend_task(
+    task_id="...",
+    amendment="Preflight answered the open question — FastMCP mount() is live-linked.",
+    actor="research",  # the task's source_agent, or "operator"
+    reason="preflight ran after queuing",
+)
+# → {"ok": true, "task_id": "...", "amendment_count": 1, "agent_may_have_started": false}
+```
+
+Once a task is queued its description is immutable. When something changes between queuing and starting — a preflight answers an open question, a dependency lands, a reviewer spots an error, scope narrows — the correction has nowhere to go, and an agent that trusts its task description will do the wrong thing.
+
+`amend_task` closes that gap **append-only**. `payload.description` is never mutated; amendments accumulate under `payload.amendments` as `{timestamp, actor, reason, text}` and readers render them after the description. What the task originally asked for stays on the record.
+
+| Rule | Behaviour |
+|---|---|
+| Who may amend | The task's `source_agent`, or `operator`. **The target agent is rejected** — it must not rewrite the instructions it was handed, the same trust boundary that makes `cancelled` operator-only. |
+| When | Any non-terminal task, including `in-progress` and `parked`. Terminal and archived tasks are rejected. |
+| in-progress | Permitted — it is the case that matters most — but the response sets `agent_may_have_started: true`, since the agent may already have read the original. Tell it out of band. |
+| Bounds | 10 amendments per task, 4096 chars each. |
+
+**Scope-creep guideline:** more than one or two amendments on a task is a signal to cancel and re-queue rather than accrete. The bounds are a backstop, not a budget.
 
 ## Status Lifecycle
 
@@ -115,11 +162,11 @@ submitted → [pending-approval] → approved → in-progress → completed
                                                  ↓
                                               failed
 
-Any non-terminal ──(operator)──> cancelled        # graceful dismissal, record kept
-Any task ──(operator quarantine)──> quarantine/    # isolate (recoverable via restore)
+Any non-terminal ──(operator)──> cancelled     # graceful dismissal, record kept
+Any non-terminal <──(operator)──> parked       # pause; stays listed, TTL-exempt
 ```
 
-The dispatcher owns the `submitted → approved/pending-approval` transitions. Agents own `approved → in-progress → completed` (or `failed`). Operators own `cancelled`, quarantine/restore, and audited status overrides. Approval gating is controlled by agent manifests and the `requires_approval` field.
+The dispatcher owns the `submitted → approved/pending-approval` transitions. Agents own `approved → in-progress → completed` (or `failed`). Operators own `cancelled`, `parked`, and audited status overrides. Approval gating is controlled by agent manifests and the `requires_approval` field.
 
 ## HTTP Control API
 
@@ -130,16 +177,20 @@ Non-MCP clients (the CloudCLI plugin and Matrix bot) can't import the Python cor
 | `POST` | `/tasks/{id}/approve` | `set_task_status(approved)` |
 | `POST` | `/tasks/{id}/cancel` | `cancel_task` |
 | `POST` | `/tasks/{id}/status` | `set_task_status` (body: `status`, `note`, `allow_override`) |
-| `POST` | `/tasks/{id}/quarantine` | `quarantine_task` |
-| `POST` | `/tasks/{id}/restore` | `restore_task` |
+| `POST` | `/tasks/{id}/park` | `park_task` |
+| `POST` | `/tasks/{id}/unpark` | `unpark_task` (body: optional `status`) |
+| `POST` | `/tasks/{id}/amend` | `amend_task` (body: `amendment`, optional `reason`) |
+| `GET` | `/queue/summary` | Counts by status across the active queue |
 
-Body fields: `actor` (default `operator`), `note`, plus `status` / `allow_override` for the status route. Responses map the canonical result: `200` ok, `404` not found, `400` validation/transition error.
+Body fields: `actor` (default `operator`), `note`, plus `status` / `allow_override` for the status route, `amendment` / `reason` for amend. Responses map the canonical result: `200` ok, `404` not found, `400` validation/transition error.
+
+`GET /queue/summary` returns `{"ok": true, "counts": {...}, "active": N, "total": N}`, where `active` is the non-terminal total. Statuses outside the server's vocabulary are bucketed under `"unknown"` rather than dropped, so records written by other direct-YAML writers stay visible in the count.
 
 **Auth:** custom routes bypass the MCP auth middleware, so a shared-secret header is the gate (defense in depth on top of the loopback-published port):
 
 - Send `X-Task-Queue-Secret: $TASK_QUEUE_API_SECRET` on every mutation.
 - The server compares it in constant time (`hmac.compare_digest`) and **fails closed** (401) when the secret is missing, wrong, or unconfigured.
-- The secret lives in `~/.secrets/forge.env` and is injected via env into the container, bot, and plugin — never committed to source.
+- The secret lives in an operator-managed env file outside the repo, injected via `env_file` into the container and into each client's environment — never committed to source.
 
 ## Deployment
 
@@ -151,11 +202,16 @@ services:
     image: task-queue-mcp:latest
     container_name: task-queue-mcp
     ports:
-      - "8485:8485"
+      # The loopback bind is load-bearing, not cosmetic. The MCP transport on this port
+      # is unauthenticated (see Trust model below), so publishing it as "8485:8485"
+      # would expose an unauthenticated queue-mutation endpoint to your whole LAN.
+      - "127.0.0.1:8485:8485"
     volumes:
-      - /home/ted/.claude/task-queue:/task-queue
+      - ~/.claude/task-queue:/task-queue   # host queue directory
     environment:
       - TASK_QUEUE_DIR=/task-queue
+      # 0.0.0.0 here is the *container-internal* bind and must stay wide, or the port
+      # mapping above has nothing to forward to. The host-side bind is what limits reach.
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8485
     cap_drop: [ALL]
@@ -165,7 +221,7 @@ services:
     user: "1000:1000"
     restart: unless-stopped
     networks:
-      - claudebox-net
+      - agent-net
 ```
 
 The container mounts only the task-queue directory read-write. The rest of the filesystem is read-only. `/tmp` is a tmpfs for transient scratch space.
@@ -200,18 +256,10 @@ docker build -t task-queue-mcp:latest .
 
 ## Development
 
-```bash
-pip install -r requirements.txt
-
-# Run tests
-pytest
-
-# Run server locally (against a local task-queue directory)
-TASK_QUEUE_DIR=/home/ted/.claude/task-queue python -m src.server
-```
+Requires Python 3.11+.
 
 ```bash
-pip install -r requirements.txt pytest pytest-cov ruff
+pip install -e ".[dev]"
 
 # Lint + format (Baseline gate)
 ruff check .
@@ -219,9 +267,12 @@ ruff format --check .
 
 # Tests with coverage (gate: >=80%)
 python -m pytest --cov=src --cov-report=term-missing
+
+# Run server locally against a local task-queue directory
+TASK_QUEUE_DIR=~/.claude/task-queue python -m src.server
 ```
 
-The test suite covers all eight tools and the HTTP control API — validation edge cases, adversarial YAML strings, illegal transitions, the quarantine/restore round-trip, operator-override auditing, and the shared-secret gate (missing/wrong secret → 401). All writes use `yaml.dump` — never string interpolation — to prevent YAML injection.
+The test suite covers every tool and the HTTP control API — validation edge cases, adversarial YAML strings, illegal transitions, the park/unpark round-trip, `amend_task` authorization (including the rejected target agent), operator-override auditing, out-of-vocabulary status repair, and the shared-secret gate (missing/wrong secret → 401). All writes use `yaml.dump` — never string interpolation — to prevent YAML injection.
 
 ## Security
 
@@ -229,7 +280,7 @@ The MCP tool endpoint on port 8485 is unauthenticated and limited to LAN/loopbac
 
 ### Trust model
 
-**Loopback is the trust boundary.** The shared secret gates only the cross-process HTTP control routes (`/tasks/...`) — it is *not* the sole barrier to mutation. All MCP tools, including the operator-mutating `set_task_status` / `cancel_task` / `quarantine_task` / `restore_task`, are reachable via the unauthenticated `/mcp/` JSON-RPC endpoint, so **any process with loopback access to port 8485 can mutate the queue without the secret.** This is intentional: the queue is internal agent-coordination state, the port is loopback-only, and the MCP transport has always been unauthenticated. The secret exists to authenticate the *specific* cross-process clients (the CloudCLI plugin and Matrix bot) over plain HTTP, not to harden the loopback boundary. If loopback trust ever becomes insufficient, gate the MCP transport with a FastMCP auth provider rather than relying on the control-route secret alone.
+**Loopback is the trust boundary.** The shared secret gates only the cross-process HTTP control routes (`/tasks/...`) — it is *not* the sole barrier to mutation. All MCP tools, including the operator-mutating `set_task_status` / `cancel_task` / `park_task` / `unpark_task` and the content-mutating `amend_task`, are reachable via the unauthenticated `/mcp/` JSON-RPC endpoint, so **any process with loopback access to port 8485 can mutate the queue without the secret.** In particular, `amend_task`'s source-agent authorization is an *integrity* control over a self-asserted `actor`, not an authentication one — it stops an agent from casually rewriting its own brief and keeps the amendment attributable in history; it does not stop a loopback process from claiming any actor it likes. This is intentional: the queue is internal agent-coordination state, the port is loopback-only, and the MCP transport has always been unauthenticated. The secret exists to authenticate the *specific* cross-process clients (the CloudCLI plugin and Matrix bot) over plain HTTP, not to harden the loopback boundary. If loopback trust ever becomes insufficient, gate the MCP transport with a FastMCP auth provider rather than relying on the control-route secret alone.
 
 ## Task File Schema
 
