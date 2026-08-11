@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **`update_task` ownership check.** `update_task_handler` now rejects any actor that is
+  neither the task's `target_agent` nor `operator`. Previously any agent could transition
+  any task, including one an operator had explicitly `parked` — closing an accepted-LOW
+  finding from the `task-queue-park-amend-2026-08` audit. vikunja#325.
+- **`VALID_TRANSITIONS["failed"]` is now an explicit literal set**, not derived from
+  `NON_TERMINAL_STATUSES`. The derived form is how `parked` silently became a valid `failed`
+  source when it was added — a future status addition can no longer widen this set without
+  an explicit code change.
+
+### Added
+- **`routing-failed` admitted to `VALID_STATUSES`.** The dispatcher has always written this
+  status on a failed dispatch attempt; it was never in the server's vocabulary, so an
+  operator had no direct way to cancel or park a task stuck there — only the out-of-vocabulary
+  repair path, with `allow_override=True` and a note. `routing-failed` is now a normal
+  non-terminal status, reachable via the standard `cancelled` and `parked` operator
+  transitions. It is deliberately **not** added to `VALID_TRANSITIONS["failed"]` — an agent
+  must not be able to terminally fail a task the dispatcher is still retrying. vikunja#324.
+
 ## [0.4.0] - 2026-08-02
 
 ### Added

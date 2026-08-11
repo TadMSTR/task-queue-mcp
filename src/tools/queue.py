@@ -17,6 +17,7 @@ VALID_STATUSES = {
     "pending-approval",
     "in-progress",
     "parked",
+    "routing-failed",
     "completed",
     "failed",
     "cancelled",
@@ -30,18 +31,19 @@ NON_TERMINAL_STATUSES = VALID_STATUSES - TERMINAL_STATUSES
 # Valid source statuses for each target transition in update_task (agent-facing, strict).
 # NB: `cancelled` is operator-only and is NOT reachable here — agents cannot cancel.
 #
-# SECURITY[accepted]: `failed` is defined in terms of NON_TERMINAL_STATUSES, so adding
-# `parked` to the vocabulary automatically admitted it here — an agent that can still see a
-# parked task via list_tasks can mark it `failed`, terminally ending a task the operator
-# deliberately paused. The other three sets are literals and did not widen (audited: only
-# `failed` is derived this way). Agents should never reach a parked task, since `in-progress`
-# is only reachable from `approved`; the underlying gap is that update_task_handler has no
-# target_agent ownership check at all, which is pre-existing and out of scope here.
-# Tracked for a real fix — see vikunja#325. (task-queue-park-amend-2026-08 audit, LOW)
+# SECURITY[fixed]: `failed` used to be defined in terms of NON_TERMINAL_STATUSES, so adding
+# `parked` to the vocabulary silently admitted it here — an agent that could still see a
+# parked task via list_tasks could mark it `failed`, terminally ending a task the operator
+# deliberately paused. Closed 2026-08-11 two ways: this set is now a literal (a future status
+# addition can no longer silently widen it) and update_task_handler gained a target_agent
+# ownership check, closing the class rather than just the parked-specific case.
+# `routing-failed` is deliberately absent — an agent must not be able to terminally fail a
+# task the dispatcher is still retrying. See vikunja#325 (task-queue-park-amend-2026-08 audit,
+# originally accepted LOW, now fixed) and vikunja#324 (routing-failed vocabulary).
 VALID_TRANSITIONS: dict[str, set[str]] = {
     "in-progress": {"approved"},  # agents must not claim unapproved tasks
     "completed": {"in-progress"},
-    "failed": NON_TERMINAL_STATUSES,
+    "failed": {"submitted", "pending-approval", "approved", "in-progress"},
 }
 
 # Operator-facing transitions (set_task_status). Broader than the agent-facing path but
@@ -399,6 +401,16 @@ def update_task_handler(
             return {
                 "ok": False,
                 "error": f"Task is in terminal status {current_status!r} and cannot be updated",
+            }
+
+        target_agent = task.get("target_agent")
+        if actor != target_agent and actor != OPERATOR_ACTOR:
+            return {
+                "ok": False,
+                "error": (
+                    f"actor {actor!r} is not the target agent for this task "
+                    f"({target_agent!r}) and may not update it."
+                ),
             }
 
         allowed_from = VALID_TRANSITIONS.get(status, set())
