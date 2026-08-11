@@ -95,8 +95,12 @@ update_task(
 | `in-progress` | `completed` |
 | Any non-terminal | `failed` |
 
-Non-terminal: `submitted`, `pending-approval`, `approved`, `in-progress`, `parked`.
+Non-terminal: `submitted`, `pending-approval`, `approved`, `in-progress`, `parked`, `routing-failed`.
 Terminal: `completed`, `failed`, `cancelled`.
+
+`routing-failed` is dispatcher-written and deliberately excluded from the `Any non-terminal → failed`
+row above — an agent must not be able to terminally fail a task the dispatcher is still retrying. It
+is a normal source for the operator transitions below (`cancelled`, `parked`, override).
 
 `retry_policy` is dispatcher-owned — `update_task` never touches it.
 
@@ -114,7 +118,7 @@ Broader than `update_task` but still audited and bounded:
 
 Terminal tasks are immutable even for operators. Every operator change appends a history entry with `actor` + `note`.
 
-**The repair path** exists because the queue directory has more than one writer. A record whose status is outside this server's vocabulary — a dispatcher-written `routing-failed`, or a historic `complete` typo — is unreachable by every other branch and would otherwise be permanently stuck. Repair only ever moves a task *out of* an invalid status; the target must still be valid, and the history entry records `repaired_from`.
+**The repair path** exists because the queue directory has more than one writer. A record whose status is outside this server's vocabulary entirely — a historic `complete` typo, or a future dispatcher status not yet admitted here — is unreachable by every other branch and would otherwise be permanently stuck. Repair only ever moves a task *out of* an invalid status; the target must still be valid, and the history entry records `repaired_from`. `routing-failed` no longer needs this path — it's a first-class non-terminal status now (see above), reachable via the standard `cancelled`/`parked` rows or the plain override row.
 
 ### park_task / unpark_task
 
@@ -162,11 +166,18 @@ submitted → [pending-approval] → approved → in-progress → completed
                                                  ↓
                                               failed
 
+routing-failed  # dispatcher-written on a failed dispatch attempt; non-terminal
+
 Any non-terminal ──(operator)──> cancelled     # graceful dismissal, record kept
 Any non-terminal <──(operator)──> parked       # pause; stays listed, TTL-exempt
 ```
 
-The dispatcher owns the `submitted → approved/pending-approval` transitions. Agents own `approved → in-progress → completed` (or `failed`). Operators own `cancelled`, `parked`, and audited status overrides. Approval gating is controlled by agent manifests and the `requires_approval` field.
+The dispatcher owns the `submitted → approved/pending-approval` transitions, and also writes
+`routing-failed` when a dispatch attempt fails (it retries on its own schedule; operators can
+also cancel, park, or force it elsewhere via `set_task_status`). Agents own `approved →
+in-progress → completed` (or `failed`) — `routing-failed` is not reachable through `update_task`.
+Operators own `cancelled`, `parked`, and audited status overrides. Approval gating is controlled
+by agent manifests and the `requires_approval` field.
 
 ## HTTP Control API
 
@@ -184,7 +195,7 @@ Non-MCP clients (the CloudCLI plugin and Matrix bot) can't import the Python cor
 
 Body fields: `actor` (default `operator`), `note`, plus `status` / `allow_override` for the status route, `amendment` / `reason` for amend. Responses map the canonical result: `200` ok, `404` not found, `400` validation/transition error.
 
-`GET /queue/summary` returns `{"ok": true, "counts": {...}, "active": N, "total": N}`, where `active` is the non-terminal total. Statuses outside the server's vocabulary are bucketed under `"unknown"` rather than dropped, so records written by other direct-YAML writers stay visible in the count.
+`GET /queue/summary` returns `{"ok": true, "counts": {...}, "active": N, "total": N}`, where `active` is the non-terminal total (now including `routing-failed`, counted by name). Statuses outside the server's vocabulary entirely are bucketed under `"unknown"` rather than dropped, so records written by other direct-YAML writers stay visible in the count.
 
 **Auth:** custom routes bypass the MCP auth middleware, so a shared-secret header is the gate (defense in depth on top of the loopback-published port):
 

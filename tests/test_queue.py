@@ -7,6 +7,11 @@ import yaml
 from src.tools.queue import (
     MAX_AMENDMENT_CHARS,
     MAX_AMENDMENTS,
+    NON_TERMINAL_STATUSES,
+    OPERATOR_ACTOR,
+    TERMINAL_STATUSES,
+    VALID_STATUSES,
+    VALID_TRANSITIONS,
     amend_task_handler,
     cancel_task_handler,
     get_task_handler,
@@ -546,6 +551,68 @@ def test_update_output_none_preserved(tmp_path):
 
     task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
     assert task["result"]["output"] is None
+
+
+def test_update_non_target_agent_rejected(tmp_path):
+    """A non-target agent must not be able to transition a task, even legally."""
+    result = make_task(tmp_path, target_agent="dev")
+    set_task_status(tmp_path, result, "approved")
+
+    update_result = update_task_handler(
+        task_id=result["task_id"],
+        status="in-progress",
+        actor="research",
+        queue_dir=str(tmp_path),
+    )
+    assert update_result["ok"] is False
+    assert "not the target agent" in update_result["error"]
+
+    unchanged = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert unchanged["status"] == "approved"
+
+
+def test_update_target_agent_still_succeeds(tmp_path):
+    """The task's actual target agent must still be able to update it."""
+    result = make_task(tmp_path, target_agent="dev")
+    set_task_status(tmp_path, result, "approved")
+
+    update_result = update_task_handler(
+        task_id=result["task_id"],
+        status="in-progress",
+        actor="dev",
+        queue_dir=str(tmp_path),
+    )
+    assert update_result["ok"] is True
+
+
+def test_update_operator_still_succeeds(tmp_path):
+    """The operator actor must bypass the target_agent check like everywhere else."""
+    result = make_task(tmp_path, target_agent="dev")
+    set_task_status(tmp_path, result, "approved")
+
+    update_result = update_task_handler(
+        task_id=result["task_id"],
+        status="in-progress",
+        actor=OPERATOR_ACTOR,
+        queue_dir=str(tmp_path),
+    )
+    assert update_result["ok"] is True
+
+
+def test_valid_transitions_failed_is_a_literal_set():
+    """
+    Pin VALID_TRANSITIONS["failed"] as an explicit literal, not NON_TERMINAL_STATUSES.
+    A future status addition (like `parked` did for the park work) must not silently
+    widen this set again — see vikunja#325.
+    """
+    assert VALID_TRANSITIONS["failed"] == {
+        "submitted",
+        "pending-approval",
+        "approved",
+        "in-progress",
+    }
+    assert "routing-failed" not in VALID_TRANSITIONS["failed"]
+    assert "parked" not in VALID_TRANSITIONS["failed"]
 
 
 def test_ttl_boundary_zero_rejected(tmp_path):
@@ -1359,7 +1426,11 @@ def test_bogus_status_repair_requires_a_note(tmp_path):
 
 
 def test_routing_failed_is_repairable(tmp_path):
-    """The dispatcher writes `routing-failed`, which is outside VALID_STATUSES."""
+    """
+    `routing-failed` is a valid status (vikunja#324) reachable via the override path
+    (any non-terminal → any non-terminal), same as any other non-terminal re-queue —
+    no longer the unrecognised-status repair path this test originally exercised.
+    """
     result = make_task(tmp_path)
     set_task_status(tmp_path, result, "routing-failed")
 
@@ -1374,6 +1445,63 @@ def test_routing_failed_is_repairable(tmp_path):
     assert r["ok"] is True
     task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
     assert task["status"] == "submitted"
+
+
+def test_routing_failed_is_directly_cancellable_by_operator(tmp_path):
+    """
+    The actual vikunja#324 fix: an operator can cancel a routing-failed task via the
+    standard `cancelled` path with no override needed, because OPERATOR_TRANSITIONS
+    derives from NON_TERMINAL_STATUSES and routing-failed now belongs to it. Before this
+    fix, routing-failed wasn't in VALID_STATUSES at all and set_task_status rejected it
+    outright.
+    """
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "routing-failed")
+
+    r = set_task_status_handler(
+        task_id=result["task_id"],
+        status="cancelled",
+        actor="ted",
+        note="verifying routing-failed is transitionable post-#324",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is True
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["status"] == "cancelled"
+
+
+def test_routing_failed_is_directly_parkable_by_operator(tmp_path):
+    """Same derived-set mechanism as cancel — pin it separately so it isn't assumed."""
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "routing-failed")
+
+    r = park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
+    assert r["ok"] is True
+    task = get_task_handler(task_id=result["task_id"], queue_dir=str(tmp_path))
+    assert task["status"] == "parked"
+    assert task["parked_from"] == "routing-failed"
+
+
+def test_routing_failed_in_valid_statuses_but_not_agent_reachable(tmp_path):
+    """
+    routing-failed must be a real status operators can act on, but must stay outside
+    the agent-facing update_task vocabulary — an agent must not be able to terminally
+    fail a task the dispatcher is still retrying.
+    """
+    assert "routing-failed" in VALID_STATUSES
+    assert "routing-failed" in NON_TERMINAL_STATUSES
+    assert TERMINAL_STATUSES == {"completed", "failed", "cancelled"}
+
+    result = make_task(tmp_path)
+    set_task_status(tmp_path, result, "routing-failed")
+
+    r = update_task_handler(
+        task_id=result["task_id"],
+        status="failed",
+        actor="dev",
+        queue_dir=str(tmp_path),
+    )
+    assert r["ok"] is False
 
 
 def test_repair_target_must_be_a_valid_status(tmp_path):

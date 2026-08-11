@@ -248,14 +248,30 @@ def test_queue_summary_buckets_unknown_statuses(env, client):
     """Out-of-vocabulary records must stay visible, not silently vanish from the count."""
     _, tmp_path = env
     _seed(tmp_path, status="complete")
+    _seed(tmp_path, status="parked")
+
+    body = client.get("/queue/summary", headers=AUTH).json()
+    assert body["counts"]["unknown"] == 1
+    assert body["counts"]["parked"] == 1
+    assert body["active"] == 1
+    assert body["total"] == 2
+
+
+def test_queue_summary_counts_routing_failed_as_active(env, client):
+    """
+    routing-failed is now a real VALID_STATUSES entry (vikunja#324), not an unknown bucket
+    — it must be counted by name and included in `active`.
+    """
+    _, tmp_path = env
     _seed(tmp_path, status="routing-failed")
     _seed(tmp_path, status="parked")
 
     body = client.get("/queue/summary", headers=AUTH).json()
-    assert body["counts"]["unknown"] == 2
+    assert body["counts"]["routing-failed"] == 1
     assert body["counts"]["parked"] == 1
-    assert body["active"] == 1
-    assert body["total"] == 3
+    assert "unknown" not in body["counts"]
+    assert body["active"] == 2
+    assert body["total"] == 2
 
 
 def test_queue_summary_requires_secret(env, client):
