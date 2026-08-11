@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-11
+
 ### Security
 - **`update_task` ownership check.** `update_task_handler` now rejects any actor that is
   neither the task's `target_agent` nor `operator`. Previously any agent could transition
