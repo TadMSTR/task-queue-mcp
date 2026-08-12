@@ -87,6 +87,10 @@ update_task(
 # → {"ok": true, "task_id": "<uuid>"} or {"ok": false, "error": "..."}
 ```
 
+**Ownership check (since v0.5.0):** `actor` must equal the task's `target_agent`, or be
+`"operator"` — any other actor is rejected. This closes the gap where an agent other than
+the one a task was assigned to could claim or complete it.
+
 **Valid transitions:**
 
 | From | To |
