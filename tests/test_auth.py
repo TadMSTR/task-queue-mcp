@@ -13,6 +13,7 @@ import importlib
 import pytest
 from starlette.testclient import TestClient
 
+import src.auth as auth_mod
 from src.auth import (
     MIN_TOKEN_LENGTH,
     AuthConfigError,
@@ -203,3 +204,59 @@ def test_control_routes_stay_on_the_shared_secret(authed_server, monkeypatch):
 
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
+
+
+# --------------------------------------------------------------------------- #
+# resolve_identity — the real path the adversarial suite stubs out
+# --------------------------------------------------------------------------- #
+
+
+class _Token:
+    def __init__(self, claims, client_id="cid"):
+        self.claims = claims
+        self.client_id = client_id
+
+
+def test_resolve_identity_is_none_without_a_token(monkeypatch):
+    """stdio, unit tests, and the control routes all land here — and None is not operator."""
+    monkeypatch.setattr(auth_mod, "get_access_token", lambda: None)
+    assert auth_mod.resolve_identity() is None
+
+
+def test_resolve_identity_reads_the_sub_claim(monkeypatch):
+    monkeypatch.setattr(auth_mod, "get_access_token", lambda: _Token({"sub": "developer"}))
+    assert auth_mod.resolve_identity() == "developer"
+
+
+def test_resolve_identity_falls_back_to_client_id(monkeypatch):
+    """StaticTokenVerifier populates client_id but never .subject; sub is the primary."""
+    monkeypatch.setattr(auth_mod, "get_access_token", lambda: _Token({}, client_id="writer"))
+    assert auth_mod.resolve_identity() == "writer"
+
+
+def test_resolve_identity_treats_an_empty_identity_as_absent(monkeypatch):
+    monkeypatch.setattr(auth_mod, "get_access_token", lambda: _Token({"sub": ""}, client_id=""))
+    assert auth_mod.resolve_identity() is None
+
+
+def test_bind_actor_accepts_a_matching_claim(monkeypatch):
+    monkeypatch.setattr(auth_mod, "resolve_identity", lambda: "developer")
+    assert auth_mod.bind_actor("developer") == (True, "developer")
+
+
+def test_bind_actor_derives_the_actor_when_none_is_claimed(monkeypatch):
+    monkeypatch.setattr(auth_mod, "resolve_identity", lambda: "developer")
+    assert auth_mod.bind_actor(None) == (True, "developer")
+
+
+def test_bind_actor_requires_an_actor_when_unauthenticated(monkeypatch):
+    monkeypatch.setattr(auth_mod, "resolve_identity", lambda: None)
+    ok, err = auth_mod.bind_actor("")
+    assert ok is False
+    assert "actor is required" in err
+
+
+def test_require_operator_surface_permits_the_call_when_unauthenticated(monkeypatch):
+    """The control routes reach the same handlers and must not be refused by this guard."""
+    monkeypatch.setattr(auth_mod, "resolve_identity", lambda: None)
+    assert auth_mod.require_operator_surface("cancel_task") is None

@@ -91,26 +91,52 @@ def test_server_cancel_task(server):
 
 
 def test_server_park_and_unpark(server, tmp_path):
+    """
+    Actor is "developer" rather than the "ted" this used to pass: the park/unpark MCP tools
+    now enforce ownership, so the acting agent must be the task's target_agent (or the
+    operator). _submit targets developer.
+    """
     r = _submit(server)
     _set_status_on_disk(tmp_path, r["filename"], "approved")
 
-    p = server.park_task(task_id=r["task_id"], actor="ted")
+    p = server.park_task(task_id=r["task_id"], actor="developer")
     assert p["ok"] is True
     # Stays visible — the point of park-as-status.
     assert len(server.list_tasks()) == 1
     assert server.get_task(r["task_id"])["status"] == "parked"
 
-    u = server.unpark_task(task_id=r["task_id"], actor="ted")
+    u = server.unpark_task(task_id=r["task_id"], actor="developer")
     assert u["ok"] is True
     assert server.get_task(r["task_id"])["status"] == "approved"
 
 
 def test_server_unpark_explicit_status(server):
     r = _submit(server)
-    server.park_task(task_id=r["task_id"], actor="ted")
-    u = server.unpark_task(task_id=r["task_id"], actor="ted", status="approved")
+    server.park_task(task_id=r["task_id"], actor="developer")
+    u = server.unpark_task(task_id=r["task_id"], actor="developer", status="approved")
     assert u["ok"] is True
     assert server.get_task(r["task_id"])["status"] == "approved"
+
+
+def test_server_park_refuses_a_non_owner(server):
+    """
+    The other half of the rule the two tests above now depend on. writer must not be able
+    to pause work addressed to developer — park is "not now, but don't lose this" about
+    your own queue, not a lever over someone else's.
+    """
+    r = _submit(server)
+    p = server.park_task(task_id=r["task_id"], actor="writer")
+    assert p["ok"] is False
+    assert "may not park or unpark it" in p["error"]
+    assert server.get_task(r["task_id"])["status"] == "submitted"
+
+
+def test_server_operator_may_park_any_task(server):
+    """Ownership enforcement must not lock the operator out of its own surface."""
+    r = _submit(server)
+    p = server.park_task(task_id=r["task_id"], actor="operator")
+    assert p["ok"] is True
+    assert server.get_task(r["task_id"])["status"] == "parked"
 
 
 def test_server_amend_task(server):

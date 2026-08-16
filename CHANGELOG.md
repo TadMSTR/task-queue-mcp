@@ -4,6 +4,72 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-16
+
+### Added
+- **`actor` is now derived from the bearer token instead of taken from the caller.** v0.7.0
+  authenticated the caller; this binds identity to that authentication. A mismatched
+  `actor` is refused rather than silently corrected — passing another agent's name is a
+  bug worth surfacing, and quietly rewriting it would hide it. Omitting `actor` is fine
+  and fills it in from the token.
+
+  This covers `source_agent` on `submit_task`, which is an identity claim rather than a
+  label: the submit-time auto-close decides whether to fire from `source_agent` /
+  `target_agent`, so binding only the `actor` arguments would have left a route to
+  terminally closing another agent's task without ever calling `update_task`. Terminal
+  statuses are immutable, so that is not a recoverable mistake.
+
+- **An ownership rule for `park_task` / `unpark_task`** — the task's `target_agent` or the
+  operator. Park is "not now, but don't lose this" about your own queue, not a lever over
+  someone else's.
+
+- **`POST /tasks/{id}/update` — the audited operator sweep.** Closing the MCP path closed
+  the *dishonest* way to tidy up another agent's stranded task (pass their name as
+  `actor`; 17 were swept that way in the release before this one, honestly annotated, and
+  only possible because `actor` was a free string). Nothing else reached it —
+  `set_task_status` cannot make terminal transitions and the `update_task` tool now
+  demands the resolved identity — so without a replacement every future stray would need
+  the operator by hand.
+
+  Pass `on_behalf_of` naming the agent whose task it is. It is verified against the task's
+  real `target_agent` (a mismatch is a 400) and **both** names are written to history:
+  `actor: operator` alongside `on_behalf_of: developer`. A sweep should read as a sweep
+  years later, not as the agent having quietly closed its own work.
+
+- **An adversarial test suite** (`tests/test_adversarial.py`) — agent A attempting to act
+  on agent B's task by every route available to it: spoofed `actor`, asserted `operator`,
+  own identity on someone else's task, spoofed `source_agent`, the auto-close path,
+  `set_task_status` override, `cancel_task`, and `park_task`. Each must fail, and the
+  honest paths are asserted alongside them so the model cannot be made strict by making it
+  wrong.
+
+### Changed
+- **`set_task_status` and `cancel_task` are operator-only** and refuse any authenticated
+  agent identity, pointing the caller at the control routes. `set_task_status` because its
+  `allow_override` path moves a task between any two non-terminal statuses — how a task
+  gets walked around a transition rule instead of satisfying it. `cancel_task` because it
+  is a terminal, irreversible judgement about someone else's work; an agent abandoning its
+  own task marks it `failed` with a reason.
+- **`actor` is pinned to `operator` on all six control-route mutations** rather than
+  defaulted via `body.get("actor", "operator")`. The default was correct in practice, but
+  it made the operator identity something a caller inherited by omission rather than
+  something anyone chose.
+
+### Fixed
+- Two tests were retargeted rather than deleted, since the behaviour they covered moved
+  rather than disappeared. `test_amend_target_agent_rejected_400` asserted a 400 from the
+  handler's authorization rule via HTTP; with the actor pinned, the body's actor never
+  reaches the handler and that scenario is no longer expressible over HTTP. It now asserts
+  the stronger property at that layer — a caller cannot choose an identity there at all.
+  The original rule remains covered at `test_queue.py::test_amend_target_agent_rejected`.
+
+### Notes
+- The containment is bounded and worth stating plainly: this contains a *mistaken or
+  prompt-injected* agent acting through its own tool surface. It is not a boundary against
+  an agent that goes looking for credentials, since the control-route shared secret is
+  readable wherever agents run as the user that owns it. That is tracked separately and
+  needs per-agent OS users or a credential broker, not a change here.
+
 ## [0.7.0] - 2026-08-16
 
 ### Added
