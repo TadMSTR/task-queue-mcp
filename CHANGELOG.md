@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-16
+
+The theme: the agent that does the work should be the agent that closes the record of it.
+`update_task`'s v0.5.0 ownership check made that the rule; nothing made it reachable.
+14 audit-request tasks had accumulated at `approved` between 2026-07-19 and 2026-08-15,
+each one a finished audit nobody could close. vikunja#382.
+
+### Added
+- **Auto-close on return-task submission.** `submit_task` with an `originating_task_id`
+  now closes that parent, when — and only when — the parent exists, is unarchived, is at
+  `approved` or `in-progress`, and **targets the submitting agent**. Submitting the return
+  task *is* closing the request. The response carries `auto_closed_task_id` when it fires.
+
+  `parent.target_agent == source_agent` is the whole bound on this feature, and it is
+  checked explicitly rather than deferring to `update_task_handler`'s ownership check —
+  that one also admits `operator`, so a caller submitting as `source_agent="operator"`
+  would otherwise be able to close anybody's task.
+
+  The eligible-source set is a literal `{"approved", "in-progress"}`, deliberately narrower
+  than "any non-terminal": `parked` is an operator's deliberate pause, `submitted` and
+  `pending-approval` have not been approved yet, and `routing-failed` is still being retried
+  by the dispatcher. An `approved` parent is walked through `in-progress` first, so its
+  history reads as claimed-then-closed rather than teleported.
+
+  It is a fail-safe, not the primary path — agents still close their own tasks explicitly.
+  Any failure inside it is logged at warning level and the submit returns normally.
+- **Three task types: `docs`, `ticket_audit`, `ticket_audit_complete`.** All three were
+  already documented in agent `CLAUDE.md` files and being called; every such `submit_task`
+  failed validation here. `docs` is the writer's work-list type, introduced when
+  `doc-update-queue.jsonl` was retired in favour of the queue.
+
+### Changed
+- **`list_tasks` rejects an unrecognised `status` instead of returning `[]`.** It used to
+  accept anything and filter on it, which is how `writer/CLAUDE.md`'s
+  `list_tasks(status="pending")` sweep — `pending` has never been a status here — returned
+  an empty list for months, indistinguishable from "no work for you". An empty list is a
+  legitimate answer to a well-formed question, so the only way to tell a typo apart from an
+  empty queue is to refuse the typo. Raises `ValueError`; FastMCP surfaces the message and
+  the valid vocabulary verbatim to the caller. Whitespace and a trailing comma are still
+  tolerated.
+
+  **Breaking for any caller passing a status outside `VALID_STATUSES`** — such a caller was
+  already receiving nothing, so the change is from silent-empty to loud-error, not from
+  working to broken.
+
 ## [0.5.0] - 2026-08-11
 
 ### Security

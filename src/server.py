@@ -67,12 +67,17 @@ def submit_task(
 ) -> dict:
     """
     Submit a new task to the queue.
+    task_type: build | deploy | fix | research | review | audit | notify | docs |
+               ticket_audit | ticket_audit_complete
     risk_level: low | medium | high
     priority: normal | high | urgent
     workflow_mode: semi-auto | auto
     context_refs: list of absolute paths relevant to this task
-    originating_task_id: UUID of the parent task; dispatcher inherits its workflow_mode
-    Returns: {ok, task_id, filename} on success or {ok: false, error} on failure.
+    originating_task_id: UUID of the parent task. The dispatcher inherits its
+      workflow_mode, and if that parent targets you and is approved or in-progress it is
+      auto-closed as completed — submitting the return task IS closing the request.
+    Returns: {ok, task_id, filename} on success, plus auto_closed_task_id when a parent was
+    closed; or {ok: false, error} on failure.
     """
     return submit_task_handler(
         source_agent=source_agent,
@@ -102,8 +107,12 @@ def list_tasks(
 ) -> list:
     """
     List tasks from the queue with optional filters.
-    status: single value or comma-separated (e.g. "submitted,approved")
-    Returns tasks sorted by created descending. Expired tasks (past ttl_days) are excluded.
+    status: single value or comma-separated (e.g. "submitted,approved"). Must be a real
+      status — an unrecognised one is an error, not an empty result.
+      Valid: submitted, approved, pending-approval, in-progress, parked, routing-failed,
+      completed, failed, cancelled.
+    Returns tasks sorted by created descending. Expired tasks (past ttl_days) are excluded;
+    parked tasks are exempt from that filter.
     """
     return list_tasks_handler(
         target_agent=target_agent,
