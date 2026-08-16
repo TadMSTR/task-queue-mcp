@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-16
+
+### Added
+- **Bearer token authentication on the MCP tool path.** The transport had none. Only the
+  seven HTTP *control* routes were gated; a comment in `server.py` referred to "the MCP
+  auth middleware", but no auth provider was ever configured on
+  `mcp.run(transport="streamable-http", ...)`.
+
+  An unauthenticated `initialize` to `/mcp` returned HTTP 200 with an `mcp-session-id`
+  issued — no bearer token, no shared secret. The port is published *and* the container
+  joins a shared Docker network, so this was reachable from well beyond the local host.
+  Any caller could invoke any tool while asserting any `actor`, including `operator`,
+  which every ownership check explicitly exempts. `completed_by` and `history[].actor`
+  were therefore claims rather than evidence, and the v0.5.0 `update_task` ownership
+  check was advisory. (vikunja#387)
+
+  Each agent now gets a distinct token via `TASK_QUEUE_TOKEN_<AGENT>`, so the token both
+  authenticates the caller and identifies it. There is no separate identity header on
+  purpose: an agent holding a token can set any header it likes on a direct request, so a
+  header-derived identity would be a weaker second channel competing with the
+  token-derived one.
+
+  The configuration fails closed in every direction it can be got wrong. The HTTP
+  transport refuses to start with no tokens at all; `load_agent_tokens` refuses an empty
+  value, a token under 16 characters, a token shared between two agents (which would
+  collapse in the identity map and mis-attribute both), and a token minted for the
+  reserved `operator` identity.
+
+### Changed
+- The control routes keep `TASK_QUEUE_API_SECRET` as their only gate and are deliberately
+  outside the new bearer auth — `custom_route` handlers bypass the transport's auth
+  provider, and these routes are the operator surface. The CloudCLI plugin and Matrix bot
+  need no changes. The stale comment claiming these routes sat outside an MCP auth
+  middleware that did not exist has been corrected.
+- README trust model rewritten. It previously argued loopback was a sufficient boundary
+  and described the MCP endpoint as "limited to LAN/loopback"; both were wrong.
+
+### Notes
+- `actor` is still a caller-supplied parameter. This release authenticates the caller but
+  does not yet derive `actor` from the authenticated identity; until it does, the
+  ownership checks remain integrity controls over a self-asserted string.
+- **Cutover is ordered.** Callers must hold their token *before* the server starts
+  demanding one: provision the per-agent tokens and roll out the client config first,
+  then restart this server. The reverse order locks every caller out at once.
+
 ## [0.6.1] - 2026-08-16
 
 ### Fixed

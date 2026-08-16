@@ -9,6 +9,7 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from src.auth import TOKEN_ENV_PREFIX, AuthConfigError, build_verifier, load_agent_tokens
 from src.tools.queue import (
     NON_TERMINAL_STATUSES,
     VALID_STATUSES,
@@ -47,7 +48,17 @@ async def lifespan(app):
     logger.info("task-queue-mcp shutting down.")
 
 
-mcp = FastMCP("task-queue", lifespan=lifespan)
+# Per-agent bearer tokens for the MCP tool path (vikunja#387). A configuration error here
+# is fatal by design: load_agent_tokens raises rather than dropping a bad entry, because
+# every way this can be misconfigured — an empty var, a shared token, a token minted for
+# `operator` — fails open or mis-attributes, and both are worse than not starting.
+try:
+    _agent_tokens = load_agent_tokens()
+except AuthConfigError as exc:
+    logger.error("Refusing to start: %s", exc)
+    sys.exit(1)
+
+mcp = FastMCP("task-queue", lifespan=lifespan, auth=build_verifier(_agent_tokens))
 
 
 @mcp.tool()
@@ -241,9 +252,18 @@ def amend_task(task_id: str, amendment: str, actor: str, reason: str = "") -> di
 # (the CloudCLI plugin and the Matrix bot). Mounted as custom routes on the
 # existing FastMCP HTTP app, so it shares this container and port 8485.
 #
-# These routes are NOT behind the MCP auth middleware, so the shared secret is
-# the only gate (defense-in-depth on top of the loopback-published port). Every
-# route delegates to the same handlers as the MCP tools, inheriting transition
+# These routes are NOT behind the MCP bearer auth added in v0.7.0 — custom_route
+# handlers bypass the transport's auth provider — so TASK_QUEUE_API_SECRET remains
+# their only gate. Until v0.7.0 that sentence read as though an MCP auth middleware
+# already existed; it did not, and the tool path was open (vikunja#387). It does now,
+# and these routes are deliberately outside it: they are the operator surface, and the
+# operator identity is reachable from here and nowhere else.
+#
+# Note this gate contains mistakes rather than intent: wherever an agent holds a shell
+# tool and runs as the OS user that owns the secret file, it can read the secret. Closing
+# that needs per-agent OS users or a credential broker, not a change here.
+#
+# Every route delegates to the same handlers as the MCP tools, inheriting transition
 # validation + fcntl locking + atomic writes. Reads stay direct in the clients.
 # ---------------------------------------------------------------------------
 
@@ -409,4 +429,23 @@ async def http_queue_summary(request: Request) -> JSONResponse:
 if __name__ == "__main__":
     host = os.getenv("MCP_HOST", "0.0.0.0")
     port = int(os.getenv("MCP_PORT", "8485"))
+
+    # Fail closed. This is the only transport this server is ever started with, and it is
+    # reachable both from the published port and from the container network it joins.
+    # Starting it without tokens is precisely the vikunja#387 state, so it must not happen
+    # quietly because a secrets file failed to mount.
+    if not _agent_tokens:
+        logger.error(
+            "Refusing to start the HTTP transport with no agent tokens configured. "
+            "Set at least one %s<AGENT> — an unauthenticated :%d is vikunja#387.",
+            TOKEN_ENV_PREFIX,
+            port,
+        )
+        sys.exit(1)
+
+    logger.info(
+        "MCP tool path authenticated for %d agent(s): %s",
+        len(_agent_tokens),
+        ", ".join(sorted(_agent_tokens.values())),
+    )
     mcp.run(transport="streamable-http", host=host, port=port)

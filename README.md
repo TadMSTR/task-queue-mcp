@@ -300,6 +300,23 @@ The container mounts only the task-queue directory read-write. The rest of the f
 | `MCP_HOST` | `0.0.0.0` | Bind host for the HTTP server |
 | `MCP_PORT` | `8485` | Port for the HTTP server |
 | `TASK_QUEUE_API_SECRET` | — | Shared secret for the HTTP control API. **Required** for any control-API mutation — fails closed (401) if unset. The MCP tools themselves do not use it. |
+| `TASK_QUEUE_TOKEN_<AGENT>` | — | Bearer token for one calling agent, e.g. `TASK_QUEUE_TOKEN_DEVELOPER`. **At least one is required** — the HTTP transport refuses to start with none. The suffix becomes the agent identity, lowercased with `_` → `-` (`TASK_QUEUE_TOKEN_DOC_HEALTH` → `doc-health`). |
+
+Each agent needs its **own** token — the token is what identifies the caller, so sharing one
+between two agents makes attribution meaningless. The server refuses to start on a shared
+token, an empty value, a token under 16 characters, or a token minted for the reserved
+`operator` identity. Generate with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Callers present it as a standard bearer header:
+
+```yaml
+headers:
+  Authorization: "Bearer ${TASK_QUEUE_TOKEN}"
+```
 
 ## Building
 
@@ -329,11 +346,24 @@ The test suite covers every tool and the HTTP control API — validation edge ca
 
 ## Security
 
-The MCP tool endpoint on port 8485 is unauthenticated and limited to LAN/loopback — the port is not proxied externally via SWAG and the host firewall blocks external access. The **HTTP control API** mutation routes additionally require a shared-secret header (`X-Task-Queue-Secret`, constant-time compare, fail-closed) — see [HTTP Control API](#http-control-api). The container runs as UID 1000 with `cap_drop: ALL`, `no-new-privileges`, and a read-only rootfs (only `/task-queue` is writable).
+Both surfaces on port 8485 require a credential:
+
+- **MCP tool path** (`/mcp`) — a per-agent bearer token, verified by FastMCP's `StaticTokenVerifier`. Missing or unknown token → 401. The transport refuses to start with no tokens configured, so this cannot silently fail open.
+- **HTTP control routes** (`/tasks/...`, `/queue/summary`) — a shared-secret header (`X-Task-Queue-Secret`, constant-time compare, fail-closed). See [HTTP Control API](#http-control-api).
+
+The container runs as UID 1000 with `cap_drop: ALL`, `no-new-privileges`, and a read-only rootfs (only `/task-queue` is writable).
 
 ### Trust model
 
-**Loopback is the trust boundary.** The shared secret gates only the cross-process HTTP control routes (`/tasks/...`) — it is *not* the sole barrier to mutation. All MCP tools, including the operator-mutating `set_task_status` / `cancel_task` / `park_task` / `unpark_task` and the content-mutating `amend_task`, are reachable via the unauthenticated `/mcp/` JSON-RPC endpoint, so **any process with loopback access to port 8485 can mutate the queue without the secret.** In particular, `amend_task`'s source-agent authorization is an *integrity* control over a self-asserted `actor`, not an authentication one — it stops an agent from casually rewriting its own brief and keeps the amendment attributable in history; it does not stop a loopback process from claiming any actor it likes. This is intentional: the queue is internal agent-coordination state, the port is loopback-only, and the MCP transport has always been unauthenticated. The secret exists to authenticate the *specific* cross-process clients (the CloudCLI plugin and Matrix bot) over plain HTTP, not to harden the loopback boundary. If loopback trust ever becomes insufficient, gate the MCP transport with a FastMCP auth provider rather than relying on the control-route secret alone.
+**Until v0.7.0 the MCP tool path was unauthenticated** and the README argued that loopback was a sufficient trust boundary. It was not: the port is published *and* the container joins a shared Docker network, so every container on that network could reach the tool path too. Any of them could call `set_task_status`, `cancel_task`, `park_task`, `unpark_task`, or `amend_task` while asserting any `actor` — including `operator`, which the ownership checks explicitly exempt. That made `completed_by` and `history[].actor` claims rather than evidence. (vikunja#387)
+
+v0.7.0 closes that path. Each agent holds a distinct token, so **the token both authenticates the caller and identifies it**. There is deliberately no separate identity header: once an agent holds a token it can set any header it likes on a direct request, so a header-derived identity would be a strictly weaker second channel competing with the token-derived one. One source of identity, not two.
+
+**What this does and does not buy.** It contains a *mistaken or prompt-injected* agent acting through its own tool surface, and it makes the audit trail mean what it says. It is deliberately **not** a boundary against an agent that goes looking for credentials: where agents hold a shell tool and run as the same OS user that owns the secret files, any token on the host is readable by any of them. Closing that needs per-agent OS users or a credential broker, and is out of scope for this server.
+
+The `operator` identity is reachable **only** from the HTTP control routes. A `TASK_QUEUE_TOKEN_OPERATOR` is rejected at startup, because `operator` is exempt from every ownership check and a token minting it on the agent-facing transport would hand its holder the whole queue.
+
+Note that `actor` remains a caller-supplied parameter on the MCP tools in this release — v0.7.0 authenticates the caller but does not yet derive `actor` from the authenticated identity. Until it does, the ownership checks remain integrity controls over a self-asserted string rather than authentication ones.
 
 ## Task File Schema
 
