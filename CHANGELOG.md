@@ -4,6 +4,67 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-16
+
+### Fixed
+- **The operator identity was spelled independently in three places** (2026-08-16 audit,
+  LOW). `queue.OPERATOR_ACTOR`, `server.OPERATOR_ACTOR`, and `auth.RESERVED_IDENTITIES`
+  each held their own `"operator"` literal with nothing tying them together.
+
+  Not exploitable as shipped — every caller pins or enforces correctly — but drift would
+  raise neither an import error nor a type error, and fails silently in *both* directions:
+  strip the HTTP control routes of the exemption every ownership check grants them, or let
+  a token be minted for the very identity those checks exempt.
+
+  `src/tools/queue.py` is now the single source of truth; `server.py` and `auth.py` import
+  it. The audit suggested `auth.py` as the home — it lives in `queue.py` instead because
+  that module is the domain layer and depends only on the standard library plus yaml, while
+  `auth.py` pulls in fastmcp; homing it there would make the queue logic transitively
+  depend on a server framework for a string. `queue → auth → server` has no cycle.
+
+  The audit found two of the three sites. `RESERVED_IDENTITIES` was the third, and
+  arguably the most coupled: it is what guarantees no agent token can carry the operator
+  name, which is the assumption `require_operator_surface` rests on.
+
+  Guarded by a **source-level** regression test. The obvious runtime check
+  (`server.OPERATOR_ACTOR is queue.OPERATOR_ACTOR`) is vacuous — CPython interns
+  identifier-like literals, so two separately-compiled `= "operator"` assignments are the
+  same object and `is` passes. Verified rather than assumed; the test reads the files, and
+  was confirmed to fail when a duplicate literal is reintroduced.
+
+## [0.8.1] - 2026-08-16
+
+### Fixed
+- **`list_tasks` hid open work once it passed its TTL** (vikunja#395). The TTL filter
+  exempted only `parked`, so `submitted`, `approved`, `pending-approval`, `in-progress`
+  and `routing-failed` tasks silently disappeared from every listing after `ttl_days`
+  while still sitting on disk waiting for someone.
+
+  That is not a stale-item guard, it is a blind spot, and it had already cost something
+  measurable: a queue sweep found **17** stranded tasks after this tool reported 13 — the
+  four oldest had aged out of the listing used to count them.
+
+  All non-terminal statuses are now exempt. Terminal records still age out of the default
+  view, because the original reasoning holds for finished work: nothing that is still
+  someone's responsibility should be hidden by a clock, and an agent handed a stale open
+  task can judge it, whereas nobody can act on a task they cannot see.
+
+- **The auto-close note now carries the return task's summary.** The submit-time auto-close
+  always wins the race against the answering agent's own explicit close — it fires during
+  `submit_task` of the return task, which necessarily precedes that call — so its note is
+  what the history actually records and the agent's own wording never lands. It read
+  `auto-closed: return task <uuid> submitted`, which says a reply happened but not what it
+  said. It now appends the return task's summary, so the trail records the outcome.
+
+### Changed
+- Two tests retargeted rather than deleted, since TTL filtering still exists for terminal
+  tasks. `test_list_excludes_expired_tasks` asserted the exact behaviour vikunja#395 calls
+  a bug; it becomes `test_list_excludes_expired_terminal_tasks`. The
+  "unparked, it expires out of the listing" assertion in `test_parked_task_survives_its_ttl`
+  is dropped — every non-terminal status is exempt now, so the parked exemption is subsumed
+  by the general rule. The test remains as a regression guard on parked specifically, which
+  predates the general rule and should survive any future narrowing of it.
+
 ## [0.8.0] - 2026-08-16
 
 ### Added

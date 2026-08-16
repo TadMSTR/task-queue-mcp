@@ -260,3 +260,43 @@ def test_require_operator_surface_permits_the_call_when_unauthenticated(monkeypa
     """The control routes reach the same handlers and must not be refused by this guard."""
     monkeypatch.setattr(auth_mod, "resolve_identity", lambda: None)
     assert auth_mod.require_operator_surface("cancel_task") is None
+
+
+def test_operator_identity_is_spelled_exactly_once_in_the_source():
+    """
+    Regression for the 2026-08-16 audit LOW. The operator string was spelled independently
+    in three places — queue.OPERATOR_ACTOR, server.OPERATOR_ACTOR, and auth's
+    RESERVED_IDENTITIES — and nothing tied them together. Drift would raise neither an
+    import error nor a type error, and fails silently in both directions: strip the HTTP
+    control routes of the exemption every ownership check grants them, or let a token be
+    minted for the very identity those checks exempt.
+
+    THIS IS A SOURCE-LEVEL CHECK ON PURPOSE. The obvious runtime version —
+    `server.OPERATOR_ACTOR is queue.OPERATOR_ACTOR` — is vacuous: CPython interns
+    identifier-like literals, so two separately-compiled `= "operator"` assignments in
+    different modules are the *same object* and `is` passes. Verified, not assumed. A test
+    that claims to catch drift while passing unconditionally is worse than no test, so the
+    check reads the files instead.
+    """
+    import re
+    from pathlib import Path
+
+    src_root = Path(__file__).resolve().parent.parent / "src"
+    assignment = re.compile(r"""^\s*\w+\s*=\s*["']operator["']""", re.MULTILINE)
+
+    sites = {
+        path.relative_to(src_root).as_posix()
+        for path in src_root.rglob("*.py")
+        if assignment.search(path.read_text())
+    }
+
+    assert sites == {"tools/queue.py"}, (
+        f"the operator identity must be defined once, in tools/queue.py; found in {sorted(sites)}. "
+        "Import OPERATOR_ACTOR from there instead of re-spelling the literal."
+    )
+    # ...and the importers really do resolve to it.
+    import src.server as srv
+    from src.tools.queue import OPERATOR_ACTOR as queue_operator
+
+    assert srv.OPERATOR_ACTOR == queue_operator
+    assert auth_mod.RESERVED_IDENTITIES == frozenset({queue_operator})

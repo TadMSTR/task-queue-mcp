@@ -351,7 +351,14 @@ def test_list_include_archived(tmp_path):
     assert len(results) == 2
 
 
-def test_list_excludes_expired_tasks(tmp_path):
+def test_list_excludes_expired_terminal_tasks(tmp_path):
+    """
+    Retargeted for vikunja#395. This used to leave the task at its default `submitted` and
+    assert it disappeared — the exact behaviour that hid open work, and how a queue sweep
+    came to find 17 stranded tasks where this tool had reported 13. TTL filtering is still
+    right for finished records, so the case moves to a terminal status rather than going
+    away; the non-terminal side is covered by test_expired_non_terminal_tasks_stay_listed.
+    """
     result = make_task(tmp_path, ttl_days=1)
 
     # Patch created to 2 days ago so the task is expired
@@ -359,6 +366,7 @@ def test_list_excludes_expired_tasks(tmp_path):
     with open(path) as f:
         data = yaml.safe_load(f)
     data["created"] = datetime.now(UTC) - timedelta(days=2)
+    data["status"] = "completed"
     with open(path, "w") as f:
         yaml.dump(data, f)
 
@@ -1328,6 +1336,12 @@ def test_parked_task_survives_its_ttl(tmp_path):
     """
     A parked task past its TTL must still be listed. Parking is a deliberate bookmark; if
     it silently expired, the status would be actively worse than leaving the task alone.
+
+    The original "unparked, it expires out of the listing" assertion has been dropped: since
+    vikunja#395 every non-terminal status is exempt, so the parked exemption is subsumed by
+    the broader rule rather than being the only thing holding the task in the listing. The
+    test stays as a regression guard on parked specifically, since that exemption predates
+    the general one and should not be lost if the general one is ever narrowed again.
     """
     result = make_task(tmp_path, ttl_days=1)
     path = tmp_path / result["filename"]
@@ -1336,9 +1350,6 @@ def test_parked_task_survives_its_ttl(tmp_path):
     data["created"] = datetime.now(UTC) - timedelta(days=30)
     with open(path, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-
-    # Unparked, it expires out of the listing.
-    assert len(list_tasks_handler(queue_dir=str(tmp_path))) == 0
 
     park_task_handler(task_id=result["task_id"], actor="ted", queue_dir=str(tmp_path))
 
@@ -1815,3 +1826,94 @@ def test_repair_target_must_be_a_valid_status(tmp_path):
     )
     assert r["ok"] is False
     assert "Invalid status" in r["error"]
+
+
+# --------------------------------------------------------------------------- #
+# vikunja#395 — the TTL filter must not hide open work
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "status", ["submitted", "approved", "pending-approval", "in-progress", "routing-failed"]
+)
+def test_expired_non_terminal_tasks_stay_listed(tmp_path, status):
+    """
+    vikunja#395. These used to vanish from list_tasks once past ttl_days while still
+    sitting on disk waiting for someone — which is how a sweep found 17 stranded tasks
+    after this tool had reported 13.
+    """
+    r = submit_task_handler(
+        source_agent="research",
+        target_agent="developer",
+        task_type="build",
+        summary="s",
+        description="d",
+        ttl_days=1,
+        queue_dir=str(tmp_path),
+    )
+    path = tmp_path / r["filename"]
+    data = yaml.safe_load(path.read_text())
+    data["status"] = status
+    data["created"] = datetime.now(UTC) - timedelta(days=30)
+    path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+
+    listed = list_tasks_handler(queue_dir=str(tmp_path))
+    assert [t["id"] for t in listed] == [r["task_id"]]
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+def test_expired_terminal_tasks_are_still_filtered(tmp_path, status):
+    """
+    The other half — finished work still ages out of the default view. The fix is about
+    not hiding what is still someone's responsibility, not about disabling TTL.
+    """
+    r = submit_task_handler(
+        source_agent="research",
+        target_agent="developer",
+        task_type="build",
+        summary="s",
+        description="d",
+        ttl_days=1,
+        queue_dir=str(tmp_path),
+    )
+    path = tmp_path / r["filename"]
+    data = yaml.safe_load(path.read_text())
+    data["status"] = status
+    data["created"] = datetime.now(UTC) - timedelta(days=30)
+    path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+
+    assert list_tasks_handler(queue_dir=str(tmp_path)) == []
+
+
+def test_auto_close_note_carries_the_return_task_summary(tmp_path):
+    """
+    The auto-close always beats the answering agent's own explicit close, so its note is
+    what the history actually records. It should say what the reply was, not just that a
+    reply happened.
+    """
+    parent = submit_task_handler(
+        source_agent="developer",
+        target_agent="security",
+        task_type="audit",
+        summary="please audit",
+        description="d",
+        queue_dir=str(tmp_path),
+    )
+    path = tmp_path / parent["filename"]
+    data = yaml.safe_load(path.read_text())
+    data["status"] = "in-progress"
+    path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+
+    submit_task_handler(
+        source_agent="security",
+        target_agent="developer",
+        task_type="audit",
+        summary="Audit complete: 0 critical, 1 medium",
+        description="d",
+        originating_task_id=parent["task_id"],
+        queue_dir=str(tmp_path),
+    )
+
+    closed = get_task_handler(task_id=parent["task_id"], queue_dir=str(tmp_path))
+    assert closed["status"] == "completed"
+    assert "Audit complete: 0 critical, 1 medium" in closed["history"][-1]["note"]

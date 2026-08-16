@@ -19,6 +19,7 @@ from src.auth import (
 )
 from src.tools.queue import (
     NON_TERMINAL_STATUSES,
+    OPERATOR_ACTOR,
     VALID_STATUSES,
     _load_all_tasks,
     amend_task_handler,
@@ -138,8 +139,9 @@ def list_tasks(
       status — an unrecognised one is an error, not an empty result.
       Valid: submitted, approved, pending-approval, in-progress, parked, routing-failed,
       completed, failed, cancelled.
-    Returns tasks sorted by created descending. Expired tasks (past ttl_days) are excluded;
-    parked tasks are exempt from that filter.
+    Returns tasks sorted by created descending. Expired tasks (past ttl_days) are excluded
+    only if they are terminal — open work stays listed however old it is, so nothing that
+    is still someone's responsibility can quietly age out of view.
     """
     return list_tasks_handler(
         target_agent=target_agent,
@@ -342,7 +344,9 @@ SECRET_HEADER = "X-Task-Queue-Secret"
 # This is narrower than it may look. The shared secret is what gates these routes, and any
 # caller that holds it can already assert this identity; pinning removes an accident, not
 # an attack. See the note on the control-API block above.
-OPERATOR_ACTOR = "operator"
+#
+# OPERATOR_ACTOR is imported from src.tools.queue — it was defined here as a second copy of
+# the same literal until the 2026-08-16 audit caught it (LOW).
 
 
 def _authorized(request: Request) -> bool:
