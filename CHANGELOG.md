@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-16
+
+### Fixed
+- **The auto-close fired on forward requests, not just returns — and closed a live
+  in-flight build task within an hour of v0.6.0 shipping.**
+
+  `originating_task_id` is overloaded. On a return task it means "this answers that
+  request". On a *forward* request it means "inherit workflow_mode from this parent", and
+  `shared-build-pre-audit` Step 4 has always told the build agent to pass its own build task
+  when filing an audit request, for exactly that reason.
+
+  v0.6.0 checked only `parent.target_agent == source_agent`, which cannot tell those apart:
+  the build task targets `developer` and `developer` is the submitter. So the first audit
+  request filed after the release auto-closed the build it belonged to. Terminal tasks are
+  immutable, so the task could not be reopened.
+
+  The auto-close now requires the full **return shape** — both halves:
+
+  ```
+  parent.target_agent == new.source_agent    # I did the parent's work
+  parent.source_agent == new.target_agent    # and I am answering the asker
+  ```
+
+  A genuine return is symmetric (audit task `developer→security`, return
+  `security→developer`). A forward request is not (build task `research→developer`, request
+  `developer→security` — `research != security`). The forward case is now logged at info
+  and skipped.
+
+  Strictly narrower than v0.6.0; it cannot newly close anything that was previously safe.
+  Two regression tests, both verified red against the v0.6.0 source.
+
 ## [0.6.0] - 2026-08-16
 
 The theme: the agent that does the work should be the agent that closes the record of it.

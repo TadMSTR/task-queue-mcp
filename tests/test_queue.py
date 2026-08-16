@@ -824,6 +824,60 @@ def test_auto_close_fires_from_in_progress(tmp_path):
     assert [h["status"] for h in closed["history"]][-1] == "completed"
 
 
+def test_auto_close_does_not_fire_on_a_forward_request(tmp_path):
+    """
+    REGRESSION, and it happened live on 2026-08-16 rather than in a test.
+
+    `originating_task_id` is overloaded. On a *return* task it means "this answers that
+    request"; on a *forward* request it means "inherit workflow_mode from this parent", which
+    is exactly what shared-build-pre-audit Step 4 has always told the build agent to pass
+    when it files an audit request.
+
+    With only the parent.target_agent == source_agent check, the two are indistinguishable —
+    the build task targets developer and developer is the submitter — so the first audit
+    request filed after v0.6.0 shipped closed its own in-flight build task. Terminal tasks
+    are immutable, so it could not be reopened.
+
+    The pair of checks tells them apart: a return is symmetric, a forward request is not.
+    """
+    build = make_task(
+        tmp_path, source_agent="research", target_agent="developer", task_type="build"
+    )
+    set_task_status(tmp_path, build, "in-progress")
+
+    audit_request = make_task(
+        tmp_path,
+        source_agent="developer",
+        target_agent="security",  # NOT back to research, so not a return
+        task_type="audit",
+        originating_task_id=build["task_id"],
+    )
+
+    assert audit_request["ok"] is True
+    assert "auto_closed_task_id" not in audit_request
+    still_open = get_task_handler(build["task_id"], queue_dir=str(tmp_path))
+    assert still_open["status"] == "in-progress"
+
+
+def test_auto_close_requires_the_full_return_shape(tmp_path):
+    """Both halves, stated as a property rather than by example."""
+    parent = _request_task(tmp_path, source="developer", target="security")
+
+    # Right source, wrong addressee — answering someone who never asked.
+    wrong_addressee = make_task(
+        tmp_path,
+        source_agent="security",
+        target_agent="sysadmin",
+        originating_task_id=parent["task_id"],
+    )
+    assert "auto_closed_task_id" not in wrong_addressee
+    assert get_task_handler(parent["task_id"], queue_dir=str(tmp_path))["status"] == "approved"
+
+    # Both halves satisfied — fires.
+    proper_return = _return_task(tmp_path, parent["task_id"])
+    assert proper_return["auto_closed_task_id"] == parent["task_id"]
+
+
 def test_auto_close_does_not_fire_when_parent_targets_someone_else(tmp_path):
     """
     THE bound on this feature. Without it, any agent could close any open task by naming it
