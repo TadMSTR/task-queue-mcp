@@ -19,6 +19,7 @@ from src.auth import (
 )
 from src.tools.queue import (
     NON_TERMINAL_STATUSES,
+    OPERATOR_ACTOR,
     VALID_STATUSES,
     _load_all_tasks,
     amend_task_handler,
@@ -343,7 +344,9 @@ SECRET_HEADER = "X-Task-Queue-Secret"
 # This is narrower than it may look. The shared secret is what gates these routes, and any
 # caller that holds it can already assert this identity; pinning removes an accident, not
 # an attack. See the note on the control-API block above.
-OPERATOR_ACTOR = "operator"
+#
+# OPERATOR_ACTOR is imported from src.tools.queue — it was defined here as a second copy of
+# the same literal until the 2026-08-16 audit caught it (LOW).
 
 
 def _authorized(request: Request) -> bool:

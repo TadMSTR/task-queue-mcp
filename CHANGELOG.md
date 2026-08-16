@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-16
+
+### Fixed
+- **The operator identity was spelled independently in three places** (2026-08-16 audit,
+  LOW). `queue.OPERATOR_ACTOR`, `server.OPERATOR_ACTOR`, and `auth.RESERVED_IDENTITIES`
+  each held their own `"operator"` literal with nothing tying them together.
+
+  Not exploitable as shipped — every caller pins or enforces correctly — but drift would
+  raise neither an import error nor a type error, and fails silently in *both* directions:
+  strip the HTTP control routes of the exemption every ownership check grants them, or let
+  a token be minted for the very identity those checks exempt.
+
+  `src/tools/queue.py` is now the single source of truth; `server.py` and `auth.py` import
+  it. The audit suggested `auth.py` as the home — it lives in `queue.py` instead because
+  that module is the domain layer and depends only on the standard library plus yaml, while
+  `auth.py` pulls in fastmcp; homing it there would make the queue logic transitively
+  depend on a server framework for a string. `queue → auth → server` has no cycle.
+
+  The audit found two of the three sites. `RESERVED_IDENTITIES` was the third, and
+  arguably the most coupled: it is what guarantees no agent token can carry the operator
+  name, which is the assumption `require_operator_surface` rests on.
+
+  Guarded by a **source-level** regression test. The obvious runtime check
+  (`server.OPERATOR_ACTOR is queue.OPERATOR_ACTOR`) is vacuous — CPython interns
+  identifier-like literals, so two separately-compiled `= "operator"` assignments are the
+  same object and `is` passes. Verified rather than assumed; the test reads the files, and
+  was confirmed to fail when a duplicate literal is reintroduced.
+
 ## [0.8.1] - 2026-08-16
 
 ### Fixed

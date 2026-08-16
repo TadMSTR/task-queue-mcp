@@ -92,6 +92,20 @@ MAX_AMENDMENT_CHARS = 4096
 # Only the agent that queued the task, or the operator, may amend it. The *target* agent
 # must not be able to rewrite the instructions it was handed — the same trust boundary
 # that already makes `cancelled` operator-only.
+#
+# THE SINGLE SOURCE OF TRUTH for the operator identity. server.py and auth.py import it
+# from here; do not re-spell the literal in either. Every ownership check in this file
+# reads `actor != owner and actor != OPERATOR_ACTOR`, and auth.py refuses to mint a token
+# for this name — which is the assumption require_operator_surface rests on. Three
+# independent spellings of one string, any of which could drift without an import error or
+# a type error, and the failure is silent in both directions: strip the HTTP control routes
+# of their exemption, or let a token be minted for an identity the handlers still exempt.
+# (audit 2026-08-16, LOW)
+#
+# It lives here rather than in auth.py, which was the audit's suggestion, because this
+# module is the domain layer and depends only on the standard library plus yaml. auth.py
+# pulls in fastmcp, and homing the constant there would make the queue logic transitively
+# depend on a server framework for a string. queue -> auth -> server has no cycle.
 OPERATOR_ACTOR = "operator"
 
 # context_refs validation: enforce absolute paths (must start with '/').

@@ -40,6 +40,8 @@ import os
 from fastmcp.server.auth import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token
 
+from src.tools.queue import OPERATOR_ACTOR
+
 logger = logging.getLogger(__name__)
 
 TOKEN_ENV_PREFIX = "TASK_QUEUE_TOKEN_"
@@ -54,7 +56,13 @@ MIN_TOKEN_LENGTH = 16
 # check exempts it from every ownership rule, so a token minted for it would hand its holder
 # the whole queue. Refused at load time, not at call time — a misconfiguration should fail
 # the deploy, not wait for someone to exercise it.
-RESERVED_IDENTITIES = frozenset({"operator"})
+#
+# Derived from queue.OPERATOR_ACTOR rather than re-spelling the literal. This set and that
+# constant have to mean the same thing or the guarantee inverts: require_operator_surface
+# refuses every resolved identity *because* no token can carry the operator name, so if
+# these two drifted apart a token could be minted for the exact identity the handlers
+# exempt. The audit flagged the server.py/queue.py pair; this was the third copy.
+RESERVED_IDENTITIES = frozenset({OPERATOR_ACTOR})
 
 
 class AuthConfigError(RuntimeError):
