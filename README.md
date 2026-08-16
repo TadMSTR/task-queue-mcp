@@ -32,7 +32,9 @@ amend it, but the target agent may not.
 submit_task(
     source_agent="research",
     target_agent="deploy-agent",  # agent name or "auto" for dispatcher routing
-    task_type="build",  # build | deploy | fix | research | review | audit | notify
+    # build | deploy | fix | research | review | audit | notify | docs |
+    # ticket_audit | ticket_audit_complete
+    task_type="build",
     summary="Deploy qmd update",
     description="Apply the qmd stack update from build plan...",
     risk_level="low",  # low | medium | high (default: low)
@@ -41,11 +43,28 @@ submit_task(
     context_refs=["/srv/agents/build-plans/qmd/plan.md"],  # absolute paths only
     ttl_days=30,
     workflow_mode="semi-auto",  # semi-auto | auto (default: semi-auto)
+    originating_task_id=None,  # UUID of the parent task, if this is a return task
 )
 # → {"ok": true, "task_id": "<uuid>", "filename": "<timestamp>-<slug>.yml"}
 ```
 
 `context_refs` must be absolute paths. `risk_level` and `priority` are validated against allowlists. `workflow_mode` controls dispatcher behavior: `semi-auto` (default) queues the task for operator pickup with a Matrix notification, while `auto` triggers the dispatcher to launch the target agent headlessly. The server generates the UUID, sets `created`, and initializes the `retry_policy` stub.
+
+#### Auto-close of the originating task (since v0.6.0)
+
+Pass `originating_task_id` and the parent is closed as `completed` — **submitting the return task is what closes the request.** The response gains `auto_closed_task_id` when it fires.
+
+It fires only if all of these hold:
+
+| Condition | Why |
+|---|---|
+| the parent resolves, and is not archived | nothing to close otherwise |
+| `parent.target_agent == source_agent` | **the bound on the whole feature** — agent A must not be able to close agent B's task by naming it as a parent. Checked here explicitly rather than relying on `update_task`'s ownership check, which also admits `operator` |
+| parent is at `approved` or `in-progress` | `parked` is an operator's deliberate pause; `submitted`/`pending-approval` are not approved yet; `routing-failed` is still being retried by the dispatcher |
+
+An `approved` parent is walked through `in-progress` first, so its history reads as claimed-then-closed rather than teleported.
+
+This is a **fail-safe, not the primary path**. Agents are still expected to close their own tasks explicitly — that puts the agent's own note in the history, where this writes only `auto-closed: return task <id> submitted`. Any failure inside the auto-close is logged at warning level and the submit returns normally; it can never fail the submit it is a side effect of.
 
 ### list_tasks
 
@@ -60,6 +79,8 @@ list_tasks(
 )
 # → list of task dicts, sorted by created descending
 ```
+
+**An unrecognised `status` is an error, not an empty result (since v0.6.0).** It used to be filtered on silently, which is how a sweep for `status="pending"` — never a status here — returned `[]` for months, indistinguishable from "no work for you". An empty list is a legitimate answer to a well-formed question, so the only way to tell a typo apart from an empty queue is to refuse the typo. Whitespace and a trailing comma are still tolerated; an empty string still means no filter.
 
 Tasks past their `ttl_days` are excluded. The dispatcher is authoritative for TTL archiving, but `list_tasks` filters them out proactively so agents don't act on stale items.
 
@@ -182,6 +203,13 @@ also cancel, park, or force it elsewhere via `set_task_status`). Agents own `app
 in-progress → completed` (or `failed`) — `routing-failed` is not reachable through `update_task`.
 Operators own `cancelled`, `parked`, and audited status overrides. Approval gating is controlled
 by agent manifests and the `requires_approval` field.
+
+**Every task is closed by its own target agent.** That follows from `update_task`'s ownership
+check, and it is the one rule to keep in mind when wiring a new cross-agent workflow: the agent
+that submits a request cannot close it, because the request targets someone else. A request/return
+pair therefore needs the *receiving* agent to claim and close its own entry — two calls, since
+`completed` is only reachable from `in-progress`. The [auto-close](#auto-close-of-the-originating-task-since-v060)
+is the fail-safe for when it doesn't, not a substitute for it.
 
 ## HTTP Control API
 

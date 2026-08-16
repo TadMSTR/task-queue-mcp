@@ -2,9 +2,11 @@ import re
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
 import yaml
 
 from src.tools.queue import (
+    AUTO_CLOSE_FROM_STATUSES,
     MAX_AMENDMENT_CHARS,
     MAX_AMENDMENTS,
     NON_TERMINAL_STATUSES,
@@ -267,6 +269,53 @@ def test_list_multiple_status_filter(tmp_path):
     assert len(results) == 1
 
 
+def test_list_rejects_unrecognised_status(tmp_path):
+    """
+    The exact bug this guards: writer/CLAUDE.md swept with status="pending", which is not a
+    status this server has, and got [] back for months — indistinguishable from an empty
+    queue. An empty list is a legitimate answer to a well-formed question, so the typo has
+    to be refused rather than filtered on.
+    """
+    make_task(tmp_path)
+
+    with pytest.raises(ValueError, match="Invalid status filter"):
+        list_tasks_handler(status="pending", queue_dir=str(tmp_path))
+
+
+def test_list_rejects_unrecognised_status_among_valid_ones(tmp_path):
+    make_task(tmp_path)
+
+    with pytest.raises(ValueError, match="pending"):
+        list_tasks_handler(status="approved,pending", queue_dir=str(tmp_path))
+
+
+def test_list_rejects_status_of_only_separators(tmp_path):
+    make_task(tmp_path)
+
+    with pytest.raises(ValueError, match="Invalid status filter"):
+        list_tasks_handler(status=",", queue_dir=str(tmp_path))
+
+
+def test_list_tolerates_whitespace_and_trailing_comma(tmp_path):
+    make_task(tmp_path)
+
+    results = list_tasks_handler(status=" submitted , approved ,", queue_dir=str(tmp_path))
+    assert len(results) == 1
+
+
+def test_list_empty_status_is_no_filter(tmp_path):
+    """An empty string is falsy and has always meant "no filter" — not a rejected value."""
+    make_task(tmp_path)
+
+    assert len(list_tasks_handler(status="", queue_dir=str(tmp_path))) == 1
+
+
+def test_list_accepts_every_valid_status(tmp_path):
+    """Guards against a status entering VALID_STATUSES but not being filterable."""
+    for status in VALID_STATUSES:
+        assert list_tasks_handler(status=status, queue_dir=str(tmp_path)) == []
+
+
 def test_list_skips_tmp_files(tmp_path):
     # Place a .tmp file — should be ignored
     (tmp_path / "fake.tmp").write_text("id: fake\n")
@@ -516,6 +565,17 @@ def test_submit_all_valid_task_types_accepted(tmp_path):
         assert result["ok"] is True, f"task_type={t!r} should be valid"
 
 
+def test_submit_accepts_task_types_the_agent_docs_already_use(tmp_path):
+    """
+    These three were documented in agent CLAUDE.md files before they existed here, so every
+    call using them failed validation. Named explicitly rather than left to the generic
+    loop above, so removing one is a test failure and not a silent regression.
+    """
+    from src.tools.queue import VALID_TASK_TYPES
+
+    assert {"docs", "ticket_audit", "ticket_audit_complete"} <= VALID_TASK_TYPES
+
+
 def test_update_archived_task_returns_error(tmp_path):
     result = make_task(tmp_path)
     task_id = result["task_id"]
@@ -700,6 +760,188 @@ def test_submit_originating_task_id_invalid_uuid_rejected(tmp_path):
     )
     assert result["ok"] is False
     assert "originating_task_id" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# auto-close on return-task submission
+#
+# The scenario throughout: `developer` submits an audit request targeting `security`;
+# security files the audit and submits a return task naming the request as its parent.
+# Submitting the return task is what closes the request.
+# ---------------------------------------------------------------------------
+
+
+def _request_task(tmp_path, target="security", source="developer", status="approved") -> dict:
+    """Create a request task in `status` and return its submit result."""
+    r = make_task(tmp_path, source_agent=source, target_agent=target, task_type="audit")
+    if status != "submitted":
+        set_task_status(tmp_path, r, status)
+    return r
+
+
+def _return_task(tmp_path, parent_id, source="security", target="developer") -> dict:
+    return make_task(
+        tmp_path,
+        source_agent=source,
+        target_agent=target,
+        task_type="build",
+        originating_task_id=parent_id,
+    )
+
+
+def test_auto_close_fires_on_return_task(tmp_path):
+    parent = _request_task(tmp_path)
+
+    child = _return_task(tmp_path, parent["task_id"])
+    assert child["ok"] is True
+    assert child["auto_closed_task_id"] == parent["task_id"]
+
+    closed = get_task_handler(parent["task_id"], queue_dir=str(tmp_path))
+    assert closed["status"] == "completed"
+    assert closed["result"]["completed_by"] == "security"
+    assert child["task_id"] in closed["history"][-1]["note"]
+
+
+def test_auto_close_walks_through_in_progress(tmp_path):
+    """approved → completed is not a legal transition; the history must show the claim."""
+    parent = _request_task(tmp_path)
+    _return_task(tmp_path, parent["task_id"])
+
+    closed = get_task_handler(parent["task_id"], queue_dir=str(tmp_path))
+    statuses = [h["status"] for h in closed["history"]]
+    assert statuses[-2:] == ["in-progress", "completed"]
+    assert all(h["actor"] == "security" for h in closed["history"][-2:])
+
+
+def test_auto_close_fires_from_in_progress(tmp_path):
+    """The agent claimed the task itself before working — no extra claim needed."""
+    parent = _request_task(tmp_path, status="in-progress")
+    child = _return_task(tmp_path, parent["task_id"])
+
+    assert child["auto_closed_task_id"] == parent["task_id"]
+    closed = get_task_handler(parent["task_id"], queue_dir=str(tmp_path))
+    assert closed["status"] == "completed"
+    assert [h["status"] for h in closed["history"]][-1] == "completed"
+
+
+def test_auto_close_does_not_fire_when_parent_targets_someone_else(tmp_path):
+    """
+    THE bound on this feature. Without it, any agent could close any open task by naming it
+    as the parent of a task it submits.
+    """
+    parent = _request_task(tmp_path, target="sysadmin")
+
+    child = _return_task(tmp_path, parent["task_id"], source="security")
+    assert child["ok"] is True
+    assert "auto_closed_task_id" not in child
+
+    untouched = get_task_handler(parent["task_id"], queue_dir=str(tmp_path))
+    assert untouched["status"] == "approved"
+
+
+def test_auto_close_does_not_fire_for_operator_source(tmp_path):
+    """
+    update_task_handler's ownership check also admits OPERATOR_ACTOR, so relying on it alone
+    would let a caller submitting as source_agent="operator" close anyone's task. The
+    explicit target_agent == source_agent check is what prevents that.
+    """
+    parent = _request_task(tmp_path, target="security")
+
+    child = _return_task(tmp_path, parent["task_id"], source=OPERATOR_ACTOR)
+    assert "auto_closed_task_id" not in child
+    assert get_task_handler(parent["task_id"], queue_dir=str(tmp_path))["status"] == "approved"
+
+
+def test_auto_close_does_not_fire_on_terminal_parent(tmp_path):
+    parent = _request_task(tmp_path, status="in-progress")
+    update_task_handler(
+        task_id=parent["task_id"], status="completed", actor="security", queue_dir=str(tmp_path)
+    )
+    before = get_task_handler(parent["task_id"], queue_dir=str(tmp_path))
+
+    child = _return_task(tmp_path, parent["task_id"])
+    assert child["ok"] is True
+    assert "auto_closed_task_id" not in child
+
+    after = get_task_handler(parent["task_id"], queue_dir=str(tmp_path))
+    assert after["history"] == before["history"]
+
+
+def test_auto_close_does_not_fire_on_parked_parent(tmp_path):
+    """Parking is a deliberate pause; auto-closing it would defeat the status entirely."""
+    parent = _request_task(tmp_path)
+    park_task_handler(task_id=parent["task_id"], actor="ted", queue_dir=str(tmp_path))
+
+    child = _return_task(tmp_path, parent["task_id"])
+    assert "auto_closed_task_id" not in child
+    assert get_task_handler(parent["task_id"], queue_dir=str(tmp_path))["status"] == "parked"
+
+
+def test_auto_close_does_not_fire_on_unapproved_parent(tmp_path):
+    parent = _request_task(tmp_path, status="submitted")
+
+    child = _return_task(tmp_path, parent["task_id"])
+    assert "auto_closed_task_id" not in child
+    assert get_task_handler(parent["task_id"], queue_dir=str(tmp_path))["status"] == "submitted"
+
+
+def test_auto_close_does_not_fire_on_routing_failed_parent(tmp_path):
+    """The dispatcher is still retrying it — closing would end a task mid-retry."""
+    parent = _request_task(tmp_path, status="routing-failed")
+
+    child = _return_task(tmp_path, parent["task_id"])
+    assert "auto_closed_task_id" not in child
+    after = get_task_handler(parent["task_id"], queue_dir=str(tmp_path))
+    assert after["status"] == "routing-failed"
+
+
+def test_auto_close_from_statuses_is_a_literal_not_derived(tmp_path):
+    """
+    Same lesson as VALID_TRANSITIONS: a set defined in terms of NON_TERMINAL_STATUSES would
+    silently admit any future status addition. This one is a literal, and must stay one.
+    """
+    assert AUTO_CLOSE_FROM_STATUSES == {"approved", "in-progress"}
+    assert AUTO_CLOSE_FROM_STATUSES < NON_TERMINAL_STATUSES
+
+
+def test_auto_close_does_not_fire_on_archived_parent(tmp_path):
+    parent = _request_task(tmp_path)
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    (tmp_path / parent["filename"]).rename(archive / parent["filename"])
+
+    child = _return_task(tmp_path, parent["task_id"])
+    assert child["ok"] is True
+    assert "auto_closed_task_id" not in child
+    assert get_task_handler(parent["task_id"], queue_dir=str(tmp_path))["status"] == "approved"
+
+
+def test_auto_close_skipped_when_parent_unresolvable(tmp_path):
+    child = _return_task(tmp_path, str(uuid.uuid4()))
+    assert child["ok"] is True
+    assert "auto_closed_task_id" not in child
+
+
+def test_auto_close_absent_when_no_originating_task_id(tmp_path):
+    assert "auto_closed_task_id" not in make_task(tmp_path)
+
+
+def test_submit_succeeds_when_auto_close_raises(tmp_path, monkeypatch):
+    """The fail-safe must never fail the submit it is a side effect of."""
+    import src.tools.queue as q
+
+    parent = _request_task(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(q, "update_task_handler", _boom)
+
+    child = _return_task(tmp_path, parent["task_id"])
+    assert child["ok"] is True
+    assert "auto_closed_task_id" not in child
+    assert (tmp_path / child["filename"]).exists()
+    assert get_task_handler(parent["task_id"], queue_dir=str(tmp_path))["status"] == "approved"
 
 
 # ---------------------------------------------------------------------------

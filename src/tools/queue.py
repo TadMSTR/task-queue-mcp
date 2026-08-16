@@ -23,7 +23,23 @@ VALID_STATUSES = {
     "cancelled",
 }
 VALID_PRIORITIES = {"normal", "high", "urgent"}
-VALID_TASK_TYPES = {"build", "deploy", "fix", "research", "review", "audit", "notify"}
+# `docs` is the writer's work-list type, introduced when doc-update-queue.jsonl was retired
+# (task-queue-lifecycle-and-doc-queue-2026-08 Phase 5). `ticket_audit` and
+# `ticket_audit_complete` were already documented in research's and security's CLAUDE.md and
+# in the vikunja ticket-audit workflow — every such submit_task call failed validation here
+# until they were added.
+VALID_TASK_TYPES = {
+    "build",
+    "deploy",
+    "fix",
+    "research",
+    "review",
+    "audit",
+    "notify",
+    "docs",
+    "ticket_audit",
+    "ticket_audit_complete",
+}
 VALID_WORKFLOW_MODES = {"semi-auto", "auto"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 NON_TERMINAL_STATUSES = VALID_STATUSES - TERMINAL_STATUSES
@@ -59,6 +75,14 @@ OPERATOR_TRANSITIONS: dict[str, set[str]] = {
 # Set when a task is parked, recording the status to return to on unpark. Unparking is a
 # non-terminal → non-terminal move, so it goes through the audited allow_override path.
 PARKED_FROM_KEY = "parked_from"
+
+# Statuses the submit-time auto-close (_auto_close_originating_task) may fire from.
+# Deliberately narrower than "any non-terminal": `completed` is only reachable from
+# `in-progress`, and each remaining non-terminal status is one the auto-close must not
+# sweep — `parked` is a deliberate operator pause that closing would defeat,
+# `submitted`/`pending-approval` have not been approved yet, and `routing-failed` is still
+# being retried by the dispatcher.
+AUTO_CLOSE_FROM_STATUSES = {"approved", "in-progress"}
 
 # amend_task bounds. More than one or two amendments on a task is a signal to cancel and
 # re-queue rather than accrete — these are a backstop, not a budget.
@@ -278,7 +302,21 @@ def submit_task_handler(
     }
 
     _write_task_atomic(path, task)
-    return {"ok": True, "task_id": task_id, "filename": filename}
+
+    result = {"ok": True, "task_id": task_id, "filename": filename}
+
+    # Fail-safe close of the parent request task. Runs after the write, and cannot fail it.
+    if originating_task_id is not None:
+        closed = _auto_close_originating_task(
+            originating_task_id=originating_task_id,
+            source_agent=source_agent,
+            new_task_id=task_id,
+            queue_dir=queue_dir,
+        )
+        if closed:
+            result["auto_closed_task_id"] = closed
+
+    return result
 
 
 def list_tasks_handler(
@@ -294,11 +332,28 @@ def list_tasks_handler(
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
 
     limit = max(1, min(limit, 200))
-    tasks = _load_all_tasks(queue_dir, include_archived=include_archived)
 
+    # Reject an unrecognised status rather than filtering on it and returning [].
+    #
+    # This used to be permissive, and the silence cost real work: writer/CLAUDE.md swept its
+    # queue with status="pending" — not a status this server has ever had — so the call
+    # matched nothing and returned an empty list for months, indistinguishable from "no work
+    # for you". Raising is deliberate: an empty list is a legitimate answer to a well-formed
+    # question, so the only way to distinguish a typo from an empty queue is to refuse the
+    # typo. FastMCP surfaces the message verbatim to the caller.
     status_filter = None
     if status:
-        status_filter = {s.strip() for s in status.split(",")}
+        requested = [s.strip() for s in status.split(",") if s.strip()]
+        invalid = [s for s in requested if s not in VALID_STATUSES]
+        if invalid or not requested:
+            raise ValueError(
+                f"Invalid status filter: {sorted(invalid) or status!r}. "
+                f"Must be one of: {sorted(VALID_STATUSES)} "
+                f"(single value or comma-separated)."
+            )
+        status_filter = set(requested)
+
+    tasks = _load_all_tasks(queue_dir, include_archived=include_archived)
 
     now = _now()
     filtered = []
@@ -450,6 +505,102 @@ def update_task_handler(
 
     logger.info("task.transition id=%s %s→%s actor=%s", task_id[:8], current_status, status, actor)
     return {"ok": True, "task_id": task_id}
+
+
+def _auto_close_originating_task(
+    originating_task_id: str,
+    source_agent: str,
+    new_task_id: str,
+    queue_dir: str,
+) -> str | None:
+    """
+    Fail-safe: close a request task when its return task is submitted.
+
+    The problem it solves: the agent that does the work is not the agent that closes the
+    record of it. A build agent submits an audit request targeting `security`; security
+    files the audit and submits a return task; nobody closes the request, because the build
+    agent is not its target agent and may not update it. 14 audit tasks accumulated that way
+    between 2026-07-19 and 2026-08-15.
+
+    Bounded by `parent.target_agent == source_agent`. That single condition is what keeps
+    this from being a cross-agent close primitive — agent A naming agent B's task as its
+    parent must not close it. It is checked here explicitly rather than relying on
+    update_task_handler's ownership check, which also admits OPERATOR_ACTOR: a caller
+    submitting as source_agent="operator" would otherwise be able to close anyone's task.
+
+    Deliberately narrower than "any non-terminal parent" (see AUTO_CLOSE_FROM_STATUSES).
+
+    Returns the parent's id if it was closed, else None. Never raises — the auto-close is a
+    convenience, and a failure here must not fail the submit that triggered it.
+    """
+    try:
+        tasks = _load_all_tasks(queue_dir, include_archived=True)
+        parent = next((t for t in tasks if t.get("id") == originating_task_id), None)
+
+        if parent is None:
+            logger.warning(
+                "auto-close skipped: originating task %s not found", originating_task_id[:8]
+            )
+            return None
+        if "archive" in parent.get("_path", ""):
+            return None
+
+        parent_status = parent.get("status")
+        if parent_status not in AUTO_CLOSE_FROM_STATUSES:
+            return None
+
+        if parent.get("target_agent") != source_agent:
+            return None
+
+        note = f"auto-closed: return task {new_task_id} submitted"
+
+        # Walk approved → in-progress first. `completed` is only reachable from
+        # `in-progress` (VALID_TRANSITIONS), and going through the real transition rather
+        # than writing the status directly keeps the history legible: the record shows the
+        # task was claimed and then closed, not teleported.
+        if parent_status == "approved":
+            claim = update_task_handler(
+                task_id=originating_task_id,
+                status="in-progress",
+                actor=source_agent,
+                note=note,
+                queue_dir=queue_dir,
+            )
+            if not claim.get("ok"):
+                logger.warning(
+                    "auto-close skipped: could not claim %s — %s",
+                    originating_task_id[:8],
+                    claim.get("error"),
+                )
+                return None
+
+        result = update_task_handler(
+            task_id=originating_task_id,
+            status="completed",
+            actor=source_agent,
+            note=note,
+            queue_dir=queue_dir,
+        )
+        if not result.get("ok"):
+            logger.warning(
+                "auto-close failed for %s — %s", originating_task_id[:8], result.get("error")
+            )
+            return None
+
+        logger.info(
+            "task.auto_close id=%s actor=%s trigger=%s",
+            originating_task_id[:8],
+            source_agent,
+            new_task_id[:8],
+        )
+        return originating_task_id
+    except Exception:
+        logger.warning(
+            "auto-close raised for originating task %s — submit unaffected",
+            originating_task_id[:8],
+            exc_info=True,
+        )
+        return None
 
 
 def set_task_status_handler(
