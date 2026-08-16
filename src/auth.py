@@ -33,10 +33,12 @@ that owns the secret files, any token on the host is readable by any of them. Ra
 floor needs per-agent OS users or a credential broker, and is out of scope here.
 """
 
+import hmac
 import logging
 import os
 
 from fastmcp.server.auth import StaticTokenVerifier
+from fastmcp.server.dependencies import get_access_token
 
 logger = logging.getLogger(__name__)
 
@@ -125,10 +127,9 @@ def build_verifier(tokens: dict[str, str]) -> StaticTokenVerifier | None:
     authorization server, the tokens are static shared secrets sourced from a 0600 env
     file, and the alternative is the status quo of no authentication whatsoever.
 
-    The `sub` claim carries the agent identity. Nothing reads it yet — binding `actor` to
-    it is the next phase — but it is set here so the token is self-describing from the
-    moment it is minted. Note StaticTokenVerifier does NOT populate AccessToken.subject;
-    it only echoes this claims dict back, so `sub` must be read from claims, not subject.
+    The `sub` claim carries the agent identity — resolve_identity() reads it back to
+    derive `actor`. Note StaticTokenVerifier does NOT populate AccessToken.subject; it
+    only echoes this claims dict back, so `sub` must be read from claims, not subject.
     """
     if not tokens:
         return None
@@ -137,4 +138,73 @@ def build_verifier(tokens: dict[str, str]) -> StaticTokenVerifier | None:
             token: {"sub": identity, "client_id": identity, "scopes": []}
             for token, identity in tokens.items()
         }
+    )
+
+
+def resolve_identity() -> str | None:
+    """
+    The authenticated agent for the request in flight, or None when auth is not active.
+
+    None means "no authenticated identity available" — on stdio, in unit tests, or on the
+    HTTP control routes, whose custom_route handlers sit outside the transport's auth
+    provider. It never means "operator": a None must not be read as permission to skip an
+    ownership check.
+    """
+    token = get_access_token()
+    if token is None:
+        return None
+    identity = (token.claims or {}).get("sub") or token.client_id
+    return identity or None
+
+
+def bind_actor(claimed: str | None) -> tuple[bool, str]:
+    """
+    Derive the acting identity for an MCP tool call. Returns (ok, actor_or_error).
+
+    The authenticated identity always wins. `claimed` survives as a tool argument only so
+    existing callers keep working and so a mismatch is an explicit refusal rather than a
+    silent rewrite — an agent passing someone else's name has a bug worth surfacing, and
+    quietly correcting it would hide that.
+
+    When no identity is resolved (stdio, tests, unauthenticated server) the claimed value
+    is used as-is. That is not a hole being left open: the network surface is closed by
+    requiring auth on the HTTP transport, which refuses to start without tokens. It keeps
+    this function honest about the one thing it can actually know.
+    """
+    resolved = resolve_identity()
+
+    if resolved is None:
+        if not claimed or not claimed.strip():
+            return False, "actor is required when the server is running without auth"
+        return True, claimed
+
+    # compare_digest over two short agent names is not about timing — it is about not
+    # growing a second, subtly different string comparison for identity anywhere.
+    if claimed and not hmac.compare_digest(claimed, resolved):
+        return False, (
+            f"actor {claimed!r} does not match the authenticated identity {resolved!r}. "
+            "actor is derived from your bearer token and cannot be asserted."
+        )
+
+    return True, resolved
+
+
+def require_operator_surface(tool: str) -> str | None:
+    """
+    Refuse an operator-only tool when an agent identity is authenticated.
+
+    Returns an error string to return to the caller, or None if the call may proceed.
+
+    `set_task_status` and `cancel_task` are operator-facing by documentation, and were
+    reachable by every agent in practice. There is no agent token that resolves to
+    `operator` — load_agent_tokens refuses to mint one — so any resolved identity here is
+    an agent, and the answer is always no. When nothing is resolved the call is on the
+    control routes, stdio, or a test, and proceeds as before.
+    """
+    resolved = resolve_identity()
+    if resolved is None:
+        return None
+    return (
+        f"{tool} is operator-only and is not reachable with an agent identity "
+        f"({resolved!r}). Use the HTTP control routes, which are the operator surface."
     )

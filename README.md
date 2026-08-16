@@ -233,13 +233,33 @@ Non-MCP clients (the CloudCLI plugin and Matrix bot) can't import the Python cor
 | `POST` | `/tasks/{id}/park` | `park_task` |
 | `POST` | `/tasks/{id}/unpark` | `unpark_task` (body: optional `status`) |
 | `POST` | `/tasks/{id}/amend` | `amend_task` (body: `amendment`, optional `reason`) |
+| `POST` | `/tasks/{id}/update` | `update_task` (body: `status`, `note`, `output`, optional `on_behalf_of`) |
 | `GET` | `/queue/summary` | Counts by status across the active queue |
 
-Body fields: `actor` (default `operator`), `note`, plus `status` / `allow_override` for the status route, `amendment` / `reason` for amend. Responses map the canonical result: `200` ok, `404` not found, `400` validation/transition error.
+Body fields: `note`, plus `status` / `allow_override` for the status route, `amendment` / `reason` for amend, `status` / `output` / `on_behalf_of` for update. Responses map the canonical result: `200` ok, `404` not found, `400` validation/transition error.
+
+**`actor` is pinned to `operator` on every one of these routes and is not read from the body** (since v0.8.0). It was previously `body.get("actor", "operator")` — correct in practice, but it made the operator identity something a caller inherited by omission rather than something anyone chose. Pinning means a future non-operator client here cannot quietly acquire the identity that every ownership check exempts.
+
+### The operator sweep — `POST /tasks/{id}/update`
+
+The only path to a terminal transition on **another agent's** task. It exists because v0.8.0 closed the dishonest version: agents used to tidy up a stranded task by passing that agent's name as `actor`, which binding `actor` to a bearer token removes. Nothing else reaches it — `set_task_status` cannot make terminal transitions and the `update_task` *tool* now demands the resolved identity — so without this every stray would need the operator to intervene by hand.
+
+Pass `on_behalf_of` naming the agent whose task it is. The handler verifies it against the task's actual `target_agent` (a mismatch is a `400`, because an operator closing a task they have misidentified should be told, not have the mistake recorded as deliberate) and writes **both** names into history:
+
+```yaml
+history:
+  - timestamp: ...
+    status: completed
+    actor: operator
+    on_behalf_of: developer
+    note: "stranded; swept during queue cleanup"
+```
+
+A sweep should read as a sweep years later, not as the agent having quietly closed its own work. `on_behalf_of` is optional — omitting it is the operator acting in its own name — and is refused outright for any non-`operator` actor.
 
 `GET /queue/summary` returns `{"ok": true, "counts": {...}, "active": N, "total": N}`, where `active` is the non-terminal total (now including `routing-failed`, counted by name). Statuses outside the server's vocabulary entirely are bucketed under `"unknown"` rather than dropped, so records written by other direct-YAML writers stay visible in the count.
 
-**Auth:** custom routes bypass the MCP auth middleware, so a shared-secret header is the gate (defense in depth on top of the loopback-published port):
+**Auth:** custom routes bypass the transport's bearer auth, so a shared-secret header is the gate — and these routes are deliberately outside it, because they are the operator surface:
 
 - Send `X-Task-Queue-Secret: $TASK_QUEUE_API_SECRET` on every mutation.
 - The server compares it in constant time (`hmac.compare_digest`) and **fails closed** (401) when the secret is missing, wrong, or unconfigured.
@@ -363,7 +383,21 @@ v0.7.0 closes that path. Each agent holds a distinct token, so **the token both 
 
 The `operator` identity is reachable **only** from the HTTP control routes. A `TASK_QUEUE_TOKEN_OPERATOR` is rejected at startup, because `operator` is exempt from every ownership check and a token minting it on the agent-facing transport would hand its holder the whole queue.
 
-Note that `actor` remains a caller-supplied parameter on the MCP tools in this release — v0.7.0 authenticates the caller but does not yet derive `actor` from the authenticated identity. Until it does, the ownership checks remain integrity controls over a self-asserted string rather than authentication ones.
+### Identity binding (since v0.8.0)
+
+`actor` is **derived from the bearer token**, not taken from the caller. Passing a name that does not match the authenticated identity is refused rather than silently corrected — the wrong name in a call is a bug worth surfacing. Omitting it is fine; it is filled in from the token.
+
+This covers `source_agent` on `submit_task` too, which is an identity claim and not just a label: the submit-time auto-close decides whether to fire from `source_agent`/`target_agent`, so spoofing it would terminally close another agent's task without ever calling `update_task`.
+
+| Tool | Who may call it |
+|---|---|
+| `submit_task`, `list_tasks`, `get_task` | any authenticated agent (`source_agent` is bound to the caller) |
+| `update_task` | the task's `target_agent`, or the operator |
+| `park_task`, `unpark_task` | the task's `target_agent`, or the operator |
+| `amend_task` | the task's `source_agent`, or the operator |
+| `set_task_status`, `cancel_task` | **operator only** — refused for any agent identity |
+
+`set_task_status` is operator-only because its `allow_override` path moves a task between any two non-terminal statuses, which is how a task gets walked around a transition rule instead of satisfying it. `cancel_task` is a terminal, irreversible judgement about someone else's work; an agent abandoning its own task marks it `failed` with a reason via `update_task`.
 
 ## Task File Schema
 

@@ -423,7 +423,24 @@ def update_task_handler(
     note: str = "",
     output: str | None = None,
     queue_dir: str | None = None,
+    on_behalf_of: str | None = None,
 ) -> dict:
+    """
+    Transition a task and append a history entry.
+
+    on_behalf_of is the audited operator sweep path, and exists because closing the MCP
+    path closed the dishonest one. Agents used to tidy up another agent's stranded task by
+    passing that agent's name as `actor` — 17 were swept that way in the release before
+    this one, honestly annotated, and only possible because `actor` was a free string. Once
+    `actor` is derived from a bearer token that route is gone, and nothing replaces it:
+    set_task_status cannot make terminal transitions, and update_task now demands the
+    resolved identity. Without this, every future stray needs the operator personally.
+
+    So the operator may close another agent's task, but must say whose it is, and the
+    history records both — `actor: operator` alongside `on_behalf_of: <agent>`. Reachable
+    only where OPERATOR_ACTOR can be asserted, which after this release is the
+    shared-secret-gated control routes and nowhere else.
+    """
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
 
@@ -431,6 +448,15 @@ def update_task_handler(
         uuid.UUID(task_id)
     except ValueError:
         return {"ok": False, "error": "invalid task_id format"}
+
+    if on_behalf_of is not None and actor != OPERATOR_ACTOR:
+        return {
+            "ok": False,
+            "error": (
+                f"on_behalf_of is reserved for the {OPERATOR_ACTOR!r} actor; "
+                f"{actor!r} may not act for another agent."
+            ),
+        }
 
     valid_update_statuses = {"in-progress", "completed", "failed"}
     if status not in valid_update_statuses:
@@ -469,6 +495,18 @@ def update_task_handler(
                 ),
             }
 
+        # A sweep names the agent it is acting for, and that name has to be right — an
+        # operator closing the wrong task should be told, not have the mistake recorded as
+        # deliberate. Checked here, under the lock, against the task actually being written.
+        if on_behalf_of is not None and on_behalf_of != target_agent:
+            return {
+                "ok": False,
+                "error": (
+                    f"on_behalf_of {on_behalf_of!r} is not the target agent for this task "
+                    f"({target_agent!r})."
+                ),
+            }
+
         allowed_from = VALID_TRANSITIONS.get(status, set())
         if current_status not in allowed_from:
             return {
@@ -496,6 +534,8 @@ def update_task_handler(
             "actor": actor,
             "note": note,
         }
+        if on_behalf_of is not None:
+            history_entry["on_behalf_of"] = on_behalf_of
         if task.get("history") is None:
             task["history"] = []
         task["history"].append(history_entry)
@@ -504,7 +544,14 @@ def update_task_handler(
         path = task.pop("_path")
         _write_task_atomic(path, task)
 
-    logger.info("task.transition id=%s %s→%s actor=%s", task_id[:8], current_status, status, actor)
+    logger.info(
+        "task.transition id=%s %s→%s actor=%s%s",
+        task_id[:8],
+        current_status,
+        status,
+        actor,
+        f" on_behalf_of={on_behalf_of}" if on_behalf_of else "",
+    )
     return {"ok": True, "task_id": task_id}
 
 
@@ -642,6 +689,7 @@ def set_task_status_handler(
     note: str = "",
     allow_override: bool = False,
     queue_dir: str | None = None,
+    enforce_ownership: bool = False,
 ) -> dict:
     """
     Operator-facing status change. Broader than update_task but audited and bounded:
@@ -657,6 +705,13 @@ def set_task_status_handler(
     Parking records the prior status in `parked_from` so unpark_task can restore it; the
     key is cleared on the way out. Terminal tasks (completed/failed/cancelled) are
     immutable. Archived tasks cannot be mutated. Every change appends a history entry.
+
+    enforce_ownership restricts the change to the task's own target_agent (or the
+    operator). It is off by default because the control routes are an operator surface and
+    the direct handler calls predate any ownership rule; the MCP park/unpark tools pass it
+    on, which is what lets an agent pause its own work without being able to pause anyone
+    else's. The remaining transitions this handler serves stay operator-only, so they never
+    reach it with it set.
     """
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
@@ -692,6 +747,17 @@ def set_task_status_handler(
                 "ok": False,
                 "error": f"Task is in terminal status {current_status!r} and cannot be updated",
             }
+
+        if enforce_ownership:
+            owner = task.get("target_agent")
+            if actor != owner and actor != OPERATOR_ACTOR:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"actor {actor!r} is not the target agent for this task "
+                        f"({owner!r}) and may not park or unpark it."
+                    ),
+                }
 
         standard_ok = current_status in OPERATOR_TRANSITIONS.get(status, set())
         override_ok = (
@@ -806,6 +872,7 @@ def park_task_handler(
     actor: str,
     note: str = "",
     queue_dir: str | None = None,
+    enforce_ownership: bool = False,
 ) -> dict:
     """
     Park a task: pause it without hiding it. The YAML stays exactly where it is and the
@@ -821,6 +888,7 @@ def park_task_handler(
         actor=actor,
         note=note or "Parked by operator",
         queue_dir=queue_dir,
+        enforce_ownership=enforce_ownership,
     )
 
 
@@ -830,6 +898,7 @@ def unpark_task_handler(
     note: str = "",
     status: str | None = None,
     queue_dir: str | None = None,
+    enforce_ownership: bool = False,
 ) -> dict:
     """
     Unpark a task, returning it to the status it was parked from. Pass `status` to send it
@@ -883,6 +952,7 @@ def unpark_task_handler(
         note=note or f"Unparked by operator (→ {target})",
         allow_override=True,
         queue_dir=queue_dir,
+        enforce_ownership=enforce_ownership,
     )
 
 

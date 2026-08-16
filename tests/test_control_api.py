@@ -12,7 +12,7 @@ import pytest
 import yaml
 from starlette.testclient import TestClient
 
-from src.tools.queue import get_task_handler, submit_task_handler
+from src.tools.queue import get_task_handler, submit_task_handler, update_task_handler
 
 SECRET = "test-secret-value"
 AUTH = {"X-Task-Queue-Secret": SECRET}
@@ -195,7 +195,18 @@ def test_amend_requires_secret(env, client):
     assert "amendments" not in get_task_handler(task_id=tid, queue_dir=str(tmp_path))["payload"]
 
 
-def test_amend_target_agent_rejected_400(env, client):
+def test_amend_ignores_a_body_supplied_actor(env, client):
+    """
+    Retargeted from test_amend_target_agent_rejected_400, which posted actor="developer"
+    (the target agent) and asserted a 400 from the handler's own authorization rule. Now
+    that the actor is pinned to `operator` on these routes the body's actor never reaches
+    the handler, so that scenario is no longer expressible over HTTP. The rule it covered
+    still lives at test_queue.py::test_amend_target_agent_rejected.
+
+    What matters at this layer is stronger: a caller cannot choose an identity here at all.
+    Passing the target agent's name must be neither honoured nor rejected — it must be
+    ignored, and the amendment recorded as the operator's.
+    """
     _, tmp_path = env
     tid = _seed(tmp_path)
     resp = client.post(
@@ -203,11 +214,12 @@ def test_amend_target_agent_rejected_400(env, client):
         headers=AUTH,
         json={"amendment": "skip the audit", "actor": "developer"},
     )
-    assert resp.status_code == 400
-    assert resp.json()["ok"] is False
+    assert resp.status_code == 200
+    task = get_task_handler(task_id=tid, queue_dir=str(tmp_path))
+    assert task["payload"]["amendments"][0]["actor"] == "operator"
 
 
-def test_amend_defaults_actor_to_operator(env, client):
+def test_amend_pins_actor_to_operator(env, client):
     """The control API is operator-facing; an omitted actor must not become the target."""
     _, tmp_path = env
     tid = _seed(tmp_path)
@@ -308,3 +320,94 @@ def test_status_empty_body_rejected(env, client):
     # No status in body -> handler rejects invalid status -> 400
     resp = client.post(f"/tasks/{tid}/status", headers=AUTH)
     assert resp.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# Operator sweep — POST /tasks/{id}/update
+# --------------------------------------------------------------------------- #
+
+
+def test_sweep_requires_the_shared_secret(env, client):
+    _, tmp_path = env
+    tid = _seed(tmp_path, status="in-progress")
+    resp = client.post(f"/tasks/{tid}/update", json={"status": "completed"})
+
+    assert resp.status_code == 401
+    assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "in-progress"
+
+
+def test_sweep_closes_another_agents_task_and_records_both_names(env, client):
+    """
+    The replacement for the route this build closed. An agent used to tidy up a stranded
+    task by passing the other agent's name as `actor`; now the operator does it explicitly
+    and the history says so — `actor: operator` alongside `on_behalf_of: developer`, rather
+    than a record that reads as though developer closed its own work.
+    """
+    _, tmp_path = env
+    tid = _seed(tmp_path, status="in-progress")
+
+    resp = client.post(
+        f"/tasks/{tid}/update",
+        headers=AUTH,
+        json={
+            "status": "completed",
+            "on_behalf_of": "developer",
+            "note": "stranded; swept during queue cleanup",
+        },
+    )
+
+    assert resp.status_code == 200
+    task = get_task_handler(task_id=tid, queue_dir=str(tmp_path))
+    assert task["status"] == "completed"
+
+    entry = task["history"][-1]
+    assert entry["actor"] == "operator"
+    assert entry["on_behalf_of"] == "developer"
+
+
+def test_sweep_rejects_a_wrong_on_behalf_of(env, client):
+    """
+    Naming the wrong agent means the operator is closing a task they have misidentified.
+    Recording that as a deliberate sweep would put a confident falsehood in the audit trail.
+    """
+    _, tmp_path = env
+    tid = _seed(tmp_path, status="in-progress")
+
+    resp = client.post(
+        f"/tasks/{tid}/update",
+        headers=AUTH,
+        json={"status": "completed", "on_behalf_of": "security"},
+    )
+
+    assert resp.status_code == 400
+    assert "is not the target agent" in resp.json()["error"]
+    assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "in-progress"
+
+
+def test_sweep_without_on_behalf_of_is_a_plain_operator_close(env, client):
+    """on_behalf_of is optional — omitting it is the operator acting in its own name."""
+    _, tmp_path = env
+    tid = _seed(tmp_path, status="in-progress")
+
+    resp = client.post(f"/tasks/{tid}/update", headers=AUTH, json={"status": "completed"})
+
+    assert resp.status_code == 200
+    entry = get_task_handler(task_id=tid, queue_dir=str(tmp_path))["history"][-1]
+    assert entry["actor"] == "operator"
+    assert "on_behalf_of" not in entry
+
+
+def test_on_behalf_of_is_refused_for_a_non_operator_actor():
+    """
+    Handler-level guard, independent of the route that pins the actor. If a future caller
+    reaches update_task_handler directly, acting-for must still be operator-only.
+    """
+    r = update_task_handler(
+        task_id="00000000-0000-0000-0000-000000000000",
+        status="completed",
+        actor="writer",
+        on_behalf_of="developer",
+    )
+
+    assert r["ok"] is False
+    assert "reserved for the 'operator' actor" in r["error"]

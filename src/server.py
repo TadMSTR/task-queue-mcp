@@ -9,7 +9,14 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.auth import TOKEN_ENV_PREFIX, AuthConfigError, build_verifier, load_agent_tokens
+from src.auth import (
+    TOKEN_ENV_PREFIX,
+    AuthConfigError,
+    bind_actor,
+    build_verifier,
+    load_agent_tokens,
+    require_operator_surface,
+)
 from src.tools.queue import (
     NON_TERMINAL_STATUSES,
     VALID_STATUSES,
@@ -87,9 +94,18 @@ def submit_task(
     originating_task_id: UUID of the parent task. The dispatcher inherits its
       workflow_mode, and if that parent targets you and is approved or in-progress it is
       auto-closed as completed — submitting the return task IS closing the request.
+    source_agent must be your own authenticated identity; you cannot file a task as
+      another agent.
     Returns: {ok, task_id, filename} on success, plus auto_closed_task_id when a parent was
     closed; or {ok: false, error} on failure.
     """
+    # source_agent is an identity claim, not just a label — the submit-time auto-close
+    # decides the return shape from it, so spoofing it is a route to terminally closing
+    # another agent's task without ever calling update_task.
+    ok, source_agent = bind_actor(source_agent)
+    if not ok:
+        return {"ok": False, "error": source_agent}
+
     return submit_task_handler(
         source_agent=source_agent,
         target_agent=target_agent,
@@ -157,8 +173,13 @@ def update_task(
     Update task status and append a history entry.
     Valid transitions: approved→in-progress, in-progress→completed, any non-terminal→failed.
     output is written to result.output on completed or failed.
+    actor is derived from your bearer token; passing another agent's name is refused.
     Returns {ok, task_id} or {ok: false, error}.
     """
+    ok, actor = bind_actor(actor)
+    if not ok:
+        return {"ok": False, "error": actor}
+
     return update_task_handler(
         task_id=task_id,
         status=status,
@@ -182,7 +203,15 @@ def set_task_status(
     submitted/pending-approval→approved, any non-terminal→cancelled. Set
     allow_override=True (with a non-empty note) to advance a missed task between any
     two non-terminal statuses. Terminal tasks are immutable. Returns {ok, task_id}.
+
+    OPERATOR ONLY — not reachable with an agent identity. The allow_override path can walk
+    a task between any two non-terminal statuses, which is how a task gets moved around a
+    transition rule it should have had to satisfy.
     """
+    refusal = require_operator_surface("set_task_status")
+    if refusal:
+        return {"ok": False, "error": refusal}
+
     return set_task_status_handler(
         task_id=task_id,
         status=status,
@@ -199,7 +228,16 @@ def cancel_task(task_id: str, actor: str, note: str = "") -> dict:
     Cancel a task — a graceful, audited terminal state for stale or unwanted tasks
     (use instead of mislabeling them `failed`). The record stays on disk. Returns
     {ok, task_id} or {ok: false, error}.
+
+    OPERATOR ONLY — not reachable with an agent identity. Cancelling is a terminal,
+    irreversible transition on someone else's work; deciding a task is no longer wanted is
+    an operator judgement. An agent abandoning its own task should mark it `failed` with a
+    reason via update_task.
     """
+    refusal = require_operator_surface("cancel_task")
+    if refusal:
+        return {"ok": False, "error": refusal}
+
     return cancel_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
 
 
@@ -210,9 +248,20 @@ def park_task(task_id: str, actor: str, note: str = "") -> dict:
     keeps appearing in list_tasks, but nothing will pick it up until it is unparked, and
     it is exempt from TTL expiry. Use for "not now, but don't lose this". Reversible via
     unpark_task, which returns it to the status it was parked from.
+    You may park a task addressed to you; the operator may park any task.
     Returns {ok, task_id} or {ok: false, error}.
     """
-    return park_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
+    ok, actor = bind_actor(actor)
+    if not ok:
+        return {"ok": False, "error": actor}
+
+    return park_task_handler(
+        task_id=task_id,
+        actor=actor,
+        note=note,
+        queue_dir=QUEUE_DIR,
+        enforce_ownership=True,
+    )
 
 
 @mcp.tool()
@@ -220,10 +269,20 @@ def unpark_task(task_id: str, actor: str, note: str = "", status: str | None = N
     """
     Unpark a task, returning it to the status it was parked from. Pass status to send it
     somewhere else instead. Reverses park_task.
+    You may unpark a task addressed to you; the operator may unpark any task.
     Returns {ok, task_id} or {ok: false, error}.
     """
+    ok, actor = bind_actor(actor)
+    if not ok:
+        return {"ok": False, "error": actor}
+
     return unpark_task_handler(
-        task_id=task_id, actor=actor, note=note, status=status, queue_dir=QUEUE_DIR
+        task_id=task_id,
+        actor=actor,
+        note=note,
+        status=status,
+        queue_dir=QUEUE_DIR,
+        enforce_ownership=True,
     )
 
 
@@ -242,6 +301,10 @@ def amend_task(task_id: str, amendment: str, actor: str, reason: str = "") -> di
 
     Returns {ok, task_id, amendment_count, agent_may_have_started} or {ok: false, error}.
     """
+    ok, actor = bind_actor(actor)
+    if not ok:
+        return {"ok": False, "error": actor}
+
     return amend_task_handler(
         task_id=task_id, amendment=amendment, actor=actor, reason=reason, queue_dir=QUEUE_DIR
     )
@@ -268,6 +331,18 @@ def amend_task(task_id: str, amendment: str, actor: str, reason: str = "") -> di
 # ---------------------------------------------------------------------------
 
 SECRET_HEADER = "X-Task-Queue-Secret"
+
+# These routes ARE the operator surface, so the actor is pinned rather than defaulted.
+# It was previously `body.get("actor", "operator")` on all six mutation routes: correct in
+# practice, but it made the operator identity something a caller inherited by omission
+# rather than something anyone chose. Pinning it means a future non-operator client on
+# these routes cannot quietly acquire the identity that every ownership check exempts —
+# it would have to be given its own path, deliberately.
+#
+# This is narrower than it may look. The shared secret is what gates these routes, and any
+# caller that holds it can already assert this identity; pinning removes an accident, not
+# an attack. See the note on the control-API block above.
+OPERATOR_ACTOR = "operator"
 
 
 def _authorized(request: Request) -> bool:
@@ -318,7 +393,7 @@ async def http_approve(request: Request) -> JSONResponse:
     result = set_task_status_handler(
         task_id=request.path_params["task_id"],
         status="approved",
-        actor=body.get("actor", "operator"),
+        actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
         queue_dir=QUEUE_DIR,
     )
@@ -332,7 +407,7 @@ async def http_cancel(request: Request) -> JSONResponse:
     body = await _json_body(request)
     result = cancel_task_handler(
         task_id=request.path_params["task_id"],
-        actor=body.get("actor", "operator"),
+        actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
         queue_dir=QUEUE_DIR,
     )
@@ -347,7 +422,7 @@ async def http_set_status(request: Request) -> JSONResponse:
     result = set_task_status_handler(
         task_id=request.path_params["task_id"],
         status=body.get("status", ""),
-        actor=body.get("actor", "operator"),
+        actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
         allow_override=bool(body.get("allow_override", False)),
         queue_dir=QUEUE_DIR,
@@ -362,7 +437,7 @@ async def http_park(request: Request) -> JSONResponse:
     body = await _json_body(request)
     result = park_task_handler(
         task_id=request.path_params["task_id"],
-        actor=body.get("actor", "operator"),
+        actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
         queue_dir=QUEUE_DIR,
     )
@@ -376,7 +451,7 @@ async def http_unpark(request: Request) -> JSONResponse:
     body = await _json_body(request)
     result = unpark_task_handler(
         task_id=request.path_params["task_id"],
-        actor=body.get("actor", "operator"),
+        actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
         status=body.get("status"),
         queue_dir=QUEUE_DIR,
@@ -392,8 +467,41 @@ async def http_amend(request: Request) -> JSONResponse:
     result = amend_task_handler(
         task_id=request.path_params["task_id"],
         amendment=body.get("amendment", ""),
-        actor=body.get("actor", "operator"),
+        actor=OPERATOR_ACTOR,
         reason=body.get("reason", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
+@mcp.custom_route("/tasks/{task_id}/update", methods=["POST"])
+async def http_update(request: Request) -> JSONResponse:
+    """
+    The operator's path to a terminal transition, including on another agent's behalf.
+
+    This exists because the previous release closed the dishonest version of it. Sweeping
+    another agent's stranded task used to be possible from any agent session by passing
+    that agent's name as `actor` — 17 tasks were tidied up that way, honestly annotated,
+    and only possible because `actor` was a free string. Binding `actor` to a bearer token
+    removes that, and nothing else reaches it: `set_task_status` cannot make terminal
+    transitions and the `update_task` tool now demands the resolved identity.
+
+    Leaving it there would mean every future stray needs the operator to intervene by hand,
+    so the capability is kept and made explicit instead. Pass `on_behalf_of` naming the
+    agent whose task it is; the handler verifies that against the task's target_agent and
+    records both names in history. A sweep should read as a sweep years later, not as the
+    agent having quietly closed its own work.
+    """
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = update_task_handler(
+        task_id=request.path_params["task_id"],
+        status=body.get("status", ""),
+        actor=OPERATOR_ACTOR,
+        note=body.get("note", ""),
+        output=body.get("output"),
+        on_behalf_of=body.get("on_behalf_of"),
         queue_dir=QUEUE_DIR,
     )
     return _control_response(result)
