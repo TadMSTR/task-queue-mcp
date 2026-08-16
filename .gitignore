@@ -16,3 +16,8 @@ htmlcov/
 # contents and any secret in its environment.
 core.*
 *.core
+
+# setuptools build artifacts (`pip install -e .` / wheel builds)
+build/
+dist/
+*.egg-info/
