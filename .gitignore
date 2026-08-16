@@ -10,4 +10,9 @@ dist/
 .coverage
 htmlcov/
 *.env
+
+# Core dumps. Both spellings — `core.<pid>` is the kernel default, `<name>.core` is what
+# a core_pattern with %e-last produces. A dump from this process would contain the queue
+# contents and any secret in its environment.
 core.*
+*.core
