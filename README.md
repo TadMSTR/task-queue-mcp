@@ -60,7 +60,17 @@ It fires only if all of these hold:
 |---|---|
 | the parent resolves, and is not archived | nothing to close otherwise |
 | `parent.target_agent == source_agent` | **the bound on the whole feature** — agent A must not be able to close agent B's task by naming it as a parent. Checked here explicitly rather than relying on `update_task`'s ownership check, which also admits `operator` |
+| `parent.source_agent == target_agent` | the other half of the **return shape** — you must be answering whoever asked. Without it a *forward* request looks identical to a return (see below) |
 | parent is at `approved` or `in-progress` | `parked` is an operator's deliberate pause; `submitted`/`pending-approval` are not approved yet; `routing-failed` is still being retried by the dispatcher |
+
+**Why both halves (since v0.6.1).** `originating_task_id` is overloaded: on a return task it means "this answers that request", but on a *forward* request it means "inherit `workflow_mode` from this parent" — which is what a build agent passes when it files an audit request for its own in-flight build. Checking only the first condition cannot tell those apart, because the build task targets the build agent and the build agent is the submitter. v0.6.0 shipped with only the first check and closed a live in-flight build task within the hour.
+
+A genuine return is symmetric; a forward request is not:
+
+| | parent | new task | fires? |
+|---|---|---|---|
+| return | audit `developer → security` | `security → developer` | yes — both halves hold |
+| forward request | build `research → developer` | audit request `developer → security` | no — `research != security` |
 
 An `approved` parent is walked through `in-progress` first, so its history reads as claimed-then-closed rather than teleported.
 

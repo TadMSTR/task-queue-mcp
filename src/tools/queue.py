@@ -310,6 +310,7 @@ def submit_task_handler(
         closed = _auto_close_originating_task(
             originating_task_id=originating_task_id,
             source_agent=source_agent,
+            target_agent=target_agent,
             new_task_id=task_id,
             queue_dir=queue_dir,
         )
@@ -510,6 +511,7 @@ def update_task_handler(
 def _auto_close_originating_task(
     originating_task_id: str,
     source_agent: str,
+    target_agent: str,
     new_task_id: str,
     queue_dir: str,
 ) -> str | None:
@@ -522,11 +524,30 @@ def _auto_close_originating_task(
     agent is not its target agent and may not update it. 14 audit tasks accumulated that way
     between 2026-07-19 and 2026-08-15.
 
-    Bounded by `parent.target_agent == source_agent`. That single condition is what keeps
-    this from being a cross-agent close primitive — agent A naming agent B's task as its
-    parent must not close it. It is checked here explicitly rather than relying on
-    update_task_handler's ownership check, which also admits OPERATOR_ACTOR: a caller
-    submitting as source_agent="operator" would otherwise be able to close anyone's task.
+    Fires only on the *return shape*: the new task must be addressed back to whoever asked.
+
+        parent.target_agent == new.source_agent    # I did the parent's work
+        parent.source_agent == new.target_agent    # and I am answering the asker
+
+    BOTH are required, and the second one is not optional bookkeeping — it is the fix for a
+    bug this feature shipped with. `originating_task_id` is overloaded: it means "inherit
+    workflow_mode from this parent" on a *forward* request as much as "this is the return
+    for that request" on a return. `shared-build-pre-audit` Step 4 has always told the build
+    agent to pass its own build task when submitting the audit request, purely for
+    workflow_mode inheritance. Under the first condition alone that looks identical to a
+    return — parent build task targets developer, developer submits — so the very first
+    audit request filed after v0.6.0 shipped auto-closed its own in-flight build task, and
+    terminal tasks are immutable, so it could not be reopened. (2026-08-16, live.)
+
+    Checking the pair distinguishes them: a genuine return is symmetric (audit task
+    developer→security, return security→developer), while a forward request is not
+    (build task research→developer, request developer→security — `research != security`).
+
+    The first condition is also what keeps this from being a cross-agent close primitive —
+    agent A naming agent B's task as its parent must not close it. It is checked here
+    explicitly rather than relying on update_task_handler's ownership check, which also
+    admits OPERATOR_ACTOR: a caller submitting as source_agent="operator" would otherwise be
+    able to close anyone's task.
 
     Deliberately narrower than "any non-terminal parent" (see AUTO_CLOSE_FROM_STATUSES).
 
@@ -549,7 +570,18 @@ def _auto_close_originating_task(
         if parent_status not in AUTO_CLOSE_FROM_STATUSES:
             return None
 
+        # The return shape, both halves. See the docstring — dropping the second check is
+        # what closed an in-flight build task on 2026-08-16.
         if parent.get("target_agent") != source_agent:
+            return None
+        if parent.get("source_agent") != target_agent:
+            logger.info(
+                "auto-close skipped: %s is a forward request, not a return "
+                "(parent asked by %r, this task is addressed to %r)",
+                originating_task_id[:8],
+                parent.get("source_agent"),
+                target_agent,
+            )
             return None
 
         note = f"auto-closed: return task {new_task_id} submitted"
