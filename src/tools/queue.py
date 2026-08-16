@@ -313,6 +313,7 @@ def submit_task_handler(
             target_agent=target_agent,
             new_task_id=task_id,
             queue_dir=queue_dir,
+            new_task_summary=summary,
         )
         if closed:
             result["auto_closed_task_id"] = closed
@@ -363,13 +364,22 @@ def list_tasks_handler(
         # dispatcher, but we filter here too so agents don't act on stale items if the
         # dispatcher falls behind.
         #
-        # Parked tasks are exempt. Parking is a deliberate "pause this, I'll come back to
-        # it" — a parked task silently vanishing at TTL would defeat the entire point of
-        # the status, which exists to give long-lived bookmarks a vocabulary.
+        # NON-TERMINAL TASKS ARE EXEMPT (vikunja#395). This used to exempt only `parked`,
+        # which meant open work — submitted, approved, in-progress, routing-failed —
+        # silently disappeared from every listing once it passed ttl_days, while still
+        # sitting on disk waiting for someone. That is not a stale-item guard, it is a
+        # blind spot, and it is how a queue sweep found 17 stranded tasks after this same
+        # tool reported 13: the four oldest had aged out of the listing that was used to
+        # count them.
+        #
+        # The original reasoning still holds for finished work, so terminal records still
+        # age out of the default view. But nothing that is still someone's responsibility
+        # should be hidden by a clock — an agent handed a stale open task can judge it,
+        # whereas nobody can act on a task they cannot see.
         created = task.get("created")
         ttl_days = task.get("ttl_days", 30)
         if (
-            task.get("status") != "parked"
+            task.get("status") not in NON_TERMINAL_STATUSES
             and created
             and isinstance(created, datetime)
             and now > created + timedelta(days=ttl_days)
@@ -561,6 +571,7 @@ def _auto_close_originating_task(
     target_agent: str,
     new_task_id: str,
     queue_dir: str,
+    new_task_summary: str = "",
 ) -> str | None:
     """
     Fail-safe: close a request task when its return task is submitted.
@@ -631,7 +642,15 @@ def _auto_close_originating_task(
             )
             return None
 
+        # Carry the return task's summary into the note. The auto-close always wins the
+        # race against the answering agent's own explicit close — it fires during
+        # submit_task of the return task, which necessarily precedes that call — so this
+        # note is what the history actually ends up recording, and the agent's own wording
+        # never lands. Without the summary the trail reads "auto-closed: return task
+        # <uuid> submitted", which says a reply happened but not what it said.
         note = f"auto-closed: return task {new_task_id} submitted"
+        if new_task_summary:
+            note = f"{note} — {new_task_summary}"
 
         # Walk approved → in-progress first. `completed` is only reachable from
         # `in-progress` (VALID_TRANSITIONS), and going through the real transition rather

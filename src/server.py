@@ -138,8 +138,9 @@ def list_tasks(
       status — an unrecognised one is an error, not an empty result.
       Valid: submitted, approved, pending-approval, in-progress, parked, routing-failed,
       completed, failed, cancelled.
-    Returns tasks sorted by created descending. Expired tasks (past ttl_days) are excluded;
-    parked tasks are exempt from that filter.
+    Returns tasks sorted by created descending. Expired tasks (past ttl_days) are excluded
+    only if they are terminal — open work stays listed however old it is, so nothing that
+    is still someone's responsibility can quietly age out of view.
     """
     return list_tasks_handler(
         target_agent=target_agent,

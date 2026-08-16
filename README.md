@@ -92,7 +92,9 @@ list_tasks(
 
 **An unrecognised `status` is an error, not an empty result (since v0.6.0).** It used to be filtered on silently, which is how a sweep for `status="pending"` — never a status here — returned `[]` for months, indistinguishable from "no work for you". An empty list is a legitimate answer to a well-formed question, so the only way to tell a typo apart from an empty queue is to refuse the typo. Whitespace and a trailing comma are still tolerated; an empty string still means no filter.
 
-Tasks past their `ttl_days` are excluded. The dispatcher is authoritative for TTL archiving, but `list_tasks` filters them out proactively so agents don't act on stale items.
+**Terminal** tasks past their `ttl_days` are excluded. The dispatcher is authoritative for TTL archiving, but `list_tasks` filters finished records out proactively so agents don't act on stale items.
+
+Non-terminal tasks are **never** TTL-filtered (since v0.8.1, vikunja#395). Open work used to vanish from listings after `ttl_days` while still sitting on disk waiting for someone — a blind spot rather than a guard, and one that had already caused a queue sweep to find 17 stranded tasks where this tool reported 13. Nothing that is still someone's responsibility should be hidden by a clock: an agent handed a stale open task can judge it, whereas nobody can act on a task they cannot see.
 
 **Parked tasks are exempt from the TTL filter.** Parking is a deliberate "pause this, I'll come back to it" — a parked task quietly expiring out of the listing would defeat the point of the status.
 

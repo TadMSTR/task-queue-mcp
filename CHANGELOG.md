@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-16
+
+### Fixed
+- **`list_tasks` hid open work once it passed its TTL** (vikunja#395). The TTL filter
+  exempted only `parked`, so `submitted`, `approved`, `pending-approval`, `in-progress`
+  and `routing-failed` tasks silently disappeared from every listing after `ttl_days`
+  while still sitting on disk waiting for someone.
+
+  That is not a stale-item guard, it is a blind spot, and it had already cost something
+  measurable: a queue sweep found **17** stranded tasks after this tool reported 13 — the
+  four oldest had aged out of the listing used to count them.
+
+  All non-terminal statuses are now exempt. Terminal records still age out of the default
+  view, because the original reasoning holds for finished work: nothing that is still
+  someone's responsibility should be hidden by a clock, and an agent handed a stale open
+  task can judge it, whereas nobody can act on a task they cannot see.
+
+- **The auto-close note now carries the return task's summary.** The submit-time auto-close
+  always wins the race against the answering agent's own explicit close — it fires during
+  `submit_task` of the return task, which necessarily precedes that call — so its note is
+  what the history actually records and the agent's own wording never lands. It read
+  `auto-closed: return task <uuid> submitted`, which says a reply happened but not what it
+  said. It now appends the return task's summary, so the trail records the outcome.
+
+### Changed
+- Two tests retargeted rather than deleted, since TTL filtering still exists for terminal
+  tasks. `test_list_excludes_expired_tasks` asserted the exact behaviour vikunja#395 calls
+  a bug; it becomes `test_list_excludes_expired_terminal_tasks`. The
+  "unparked, it expires out of the listing" assertion in `test_parked_task_survives_its_ttl`
+  is dropped — every non-terminal status is exempt now, so the parked exemption is subsumed
+  by the general rule. The test remains as a regression guard on parked specifically, which
+  predates the general rule and should survive any future narrowing of it.
+
 ## [0.8.0] - 2026-08-16
 
 ### Added
