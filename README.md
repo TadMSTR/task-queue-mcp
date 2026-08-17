@@ -405,9 +405,9 @@ This covers `source_agent` on `submit_task` too, which is an identity claim and 
 
 Tasks are YAML files in `~/.claude/task-queue/`, named `YYYYMMDD-HHMMSS-<uuid-prefix>.yml`. All writes are atomic (write to `.tmp`, then `os.rename()`). Per-task file locks via `fcntl.flock` prevent races between concurrent MCP calls and the dispatcher.
 
-For the full schema and lifecycle documentation, see the [homelab-agent component doc](https://github.com/TadMSTR/homelab-agent/blob/main/docs/components/task-queue-mcp.md).
+For the full schema and lifecycle documentation, see the [homelab-agent component doc](https://github.com/TadMSTR/homelab-agent/blob/main/docs/components/agent/task-queue-mcp.md).
 
 ## Related
 
 - [homelab-agent](https://github.com/TadMSTR/homelab-agent) — agent orchestration documentation
-- [task-dispatcher](https://github.com/TadMSTR/homelab-agent/blob/main/docs/components/task-dispatcher.md) — the dispatcher that routes and gates tasks
+- [task-dispatcher](https://github.com/TadMSTR/homelab-agent/blob/main/docs/components/agent/task-dispatcher.md) — the dispatcher that routes and gates tasks
