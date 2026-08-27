@@ -40,7 +40,36 @@ VALID_TASK_TYPES = {
     "ticket_audit",
     "ticket_audit_complete",
 }
-VALID_WORKFLOW_MODES = {"semi-auto", "auto"}
+# `manual-then-auto` gates only its OWN leg: the dispatcher queues it for operator pickup
+# exactly like `semi-auto`, but every task spawned by the resulting session inherits `auto`.
+# It answers a different question from the other two — those describe how this task starts,
+# this one describes the shape of the chain hanging off it. Added by
+# task-queue-headless-chain-2026-08 (vikunja#533) because an operator's `semi-auto` start
+# pinned every downstream handoff to `semi-auto` too, which is how four security→steward
+# return tasks sat unactioned from 2026-08-18.
+#
+# The downgrade itself lives in the dispatcher (`child_workflow_mode()`), not here — this
+# module never spawns anything. What this set does is make the value expressible at all.
+VALID_WORKFLOW_MODES = {"semi-auto", "auto", "manual-then-auto"}
+
+# Task types that are self-terminal: recorded and closed by `submit_task`, never launched,
+# never queued for anyone. A `notify` task carries a result somebody may want to read, not
+# work anybody has to do. (vikunja#507)
+#
+# SECURITY: this bypasses the approval path by design, so the bound that matters is that a
+# `notify` task must never be able to carry an instruction an agent would act on. Two things
+# hold that line: `requires_approval` is forced False (there is nothing left to approve once
+# the task is already terminal, so honouring it would only produce an unreachable state),
+# and the task is never `approved`, so it cannot appear in the `list_tasks(status="approved")`
+# sweep every agent uses as its work list. Note it IS still visible to an unfiltered
+# `list_tasks` until its TTL expires — terminal records age out on the clock, they are not
+# excluded by status — which is the intent: readable, not assignable.
+#
+# Converting an ACTIONABLE return task to `notify` would therefore silently drop real work.
+# See CHANGELOG for the one call site that was converted and the three that deliberately
+# were not.
+SELF_TERMINAL_TASK_TYPES = {"notify"}
+
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 NON_TERMINAL_STATUSES = VALID_STATUSES - TERMINAL_STATUSES
 
@@ -283,6 +312,24 @@ def submit_task_handler(
     if originating_task_id is not None:
         payload["originating_task_id"] = originating_task_id
 
+    # A self-terminal type is recorded and closed in the same write. The `submitted` entry
+    # is kept and a `completed` entry appended rather than writing `completed` alone, for
+    # the same reason the auto-close walks approved → in-progress → completed instead of
+    # teleporting: the history should read as something that happened, not as a task that
+    # sprang into existence finished.
+    #
+    # This does not go through VALID_TRANSITIONS (`completed` from `submitted` is not a
+    # legal agent move, and must not become one). It is a distinct creation path, not a
+    # transition — nothing here widens what `update_task` will accept.
+    self_terminal = task_type in SELF_TERMINAL_TASK_TYPES
+    approval_overridden = False
+    if self_terminal:
+        # Forced, not honoured. See SELF_TERMINAL_TASK_TYPES. Recorded in the note when the
+        # caller actually asked for the opposite, so the override is visible in the trail
+        # rather than being a silent disagreement between the call and the record.
+        approval_overridden = bool(requires_approval)
+        requires_approval = False
+
     task = {
         "id": task_id,
         "created": now,
@@ -292,14 +339,14 @@ def submit_task_handler(
         "risk_level": risk_level,
         "requires_approval": requires_approval,
         "workflow_mode": workflow_mode,
-        "status": "submitted",
+        "status": "completed" if self_terminal else "submitted",
         "summary": summary,
         "ttl_days": ttl_days,
         "payload": payload,
         "result": {
-            "output": None,
-            "completed_by": None,
-            "completed_at": None,
+            "output": description if self_terminal else None,
+            "completed_by": f"{source_agent} ({task_type})" if self_terminal else None,
+            "completed_at": now if self_terminal else None,
         },
         "history": [
             {
@@ -315,9 +362,32 @@ def submit_task_handler(
         },
     }
 
+    if self_terminal:
+        note = "Notification delivered — no session required"
+        if approval_overridden:
+            note = f"{note} (requires_approval=True ignored: {task_type} is self-terminal)"
+        task["history"].append(
+            {
+                "timestamp": now,
+                "status": "completed",
+                "actor": source_agent,
+                "note": note,
+            }
+        )
+
     _write_task_atomic(path, task)
 
     result = {"ok": True, "task_id": task_id, "filename": filename}
+    if self_terminal:
+        result["status"] = "completed"
+        result["self_terminal"] = True
+        logger.info(
+            "task.notify_delivered id=%s %s→%s summary=%r",
+            task_id[:8],
+            source_agent,
+            target_agent,
+            summary,
+        )
 
     # Fail-safe close of the parent request task. Runs after the write, and cannot fail it.
     if originating_task_id is not None:
