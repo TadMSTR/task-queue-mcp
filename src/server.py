@@ -88,17 +88,27 @@ def submit_task(
     Submit a new task to the queue.
     task_type: build | deploy | fix | research | review | audit | notify | docs |
                ticket_audit | ticket_audit_complete
+      `notify` is SELF-TERMINAL: the task is written straight to `completed`, no agent is
+      ever launched for it and nobody has to close it. Use it for "here is a result,
+      nothing to do" — a verdict, an outcome, an FYI. Do NOT use it to ask for work: a
+      notify task never reaches anyone's work list, so the request would vanish silently.
+      `requires_approval` is forced False for this type.
     risk_level: low | medium | high
     priority: normal | high | urgent
-    workflow_mode: semi-auto | auto
+    workflow_mode: semi-auto | auto | manual-then-auto
+      `manual-then-auto` gates only THIS task — it waits for an operator Start exactly like
+      `semi-auto` — while every task the resulting session spawns inherits `auto`. Use it to
+      start a headless chain once and let the rest of it run itself.
     context_refs: list of absolute paths relevant to this task
     originating_task_id: UUID of the parent task. The dispatcher inherits its
       workflow_mode, and if that parent targets you and is approved or in-progress it is
-      auto-closed as completed — submitting the return task IS closing the request.
+      auto-closed as completed — submitting the return task IS closing the request. This
+      still holds for `notify`: a notification closes the request it answers.
     source_agent must be your own authenticated identity; you cannot file a task as
       another agent.
     Returns: {ok, task_id, filename} on success, plus auto_closed_task_id when a parent was
-    closed; or {ok: false, error} on failure.
+    closed and status/self_terminal for a self-terminal type; or {ok: false, error} on
+    failure.
     """
     # source_agent is an identity claim, not just a label — the submit-time auto-close
     # decides the return shape from it, so spoofing it is a route to terminally closing

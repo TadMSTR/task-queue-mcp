@@ -4,6 +4,76 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-27
+
+Two changes so an operator can start a headless chain once and have it run and close
+itself. Build `task-queue-headless-chain-2026-08`; vikunja#507, #533, #324.
+
+### Added
+- **`notify` is now self-terminal** (vikunja#507). `notify` has been in `VALID_TASK_TYPES`
+  since the vocabulary was written and *nothing* honoured it — the dispatcher special-cases
+  `workflow` and `audit` and had no branch for it, so a notification fell through to the
+  generic launch path like any other work item.
+
+  `submit_task` now writes a `notify` task straight to `completed`: `result.output` carries
+  the description, `result.completed_by` is `<source> (notify)`, and the history reads
+  `submitted → completed` rather than springing into existence finished. No session is
+  launched, no row is left for anyone to close.
+
+  The concrete waste this removes: `f42d3aeb` spent an entire steward session reading a
+  one-line countersign verdict to conclude there was nothing to do, and three more
+  countersign returns sat at `approved` from 2026-08-18 to 2026-08-25 with nobody to close
+  them, because the *last* leg of a chain has nothing to return to.
+
+  `requires_approval` is forced `False` for the type — there is nothing to approve once the
+  task is already terminal, so honouring it would only produce an unreachable state. When a
+  caller passed `True`, the override is recorded in the history note rather than silently
+  disagreeing with the call.
+
+  **The auto-close was deliberately not touched.** `_auto_close_originating_task` runs after
+  the write and is independent of the new task's own status, so a `notify` still closes the
+  request it answers exactly as any return task does. Both halves are asserted together —
+  the terminal write must not short-circuit the parent close.
+
+  Only ONE call site was converted: `security-config-countersign`'s return to steward, which
+  is a verdict with a human merge and a password-gated apply behind it. Three others were
+  audited and deliberately left alone, because converting an actionable return would drop
+  real work silently: `shared-build-pre-audit` asks security to run an audit,
+  `security-audit-run` asks the build agent to remediate findings, and
+  `shared-build-finalize` asks the writer to write docs.
+
+  Separately: that skill had been telling security to submit
+  `task_type="config_countersign_complete"`, a value that has never been in
+  `VALID_TASK_TYPES`. Every such call was rejected and security fell back to `review` —
+  which routes as work. Fixed in the same change.
+
+- **`manual-then-auto` workflow mode** (vikunja#533). Gates only its own leg: the dispatcher
+  queues it for operator pickup exactly like `semi-auto`, while every task the resulting
+  session spawns inherits `auto`.
+
+  `workflow_mode` previously conflated two questions — "does *this* task need a Start?" and
+  "does everything downstream?" — and #476 made the inheritance reliable, which is precisely
+  why an operator's `semi-auto` start began pinning every downstream handoff to `semi-auto`.
+  There was no way to express "gate the first leg only", which is how four return tasks
+  accumulated unnoticed.
+
+  This module only makes the value expressible; the downgrade itself lives in the
+  dispatcher's `child_workflow_mode()`, because nothing here spawns anything. The value is
+  stored verbatim on the parent — downgrading on write would leave the dispatcher nothing to
+  gate on and make the mode behave as plain `auto`.
+
+  `manual` remains invalid and always has been, despite `run-steward.sh` having accepted it
+  since day one. That launcher now rejects it too.
+
+### Notes
+- `VALID_TRANSITIONS` is unchanged and asserted so. `completed` from `submitted` is legal
+  for the new *creation* path and remains illegal as an agent move — the self-terminal write
+  is not a back door into `update_task`.
+- The dispatcher (`host-forge/scripts`) now carries a copy of this module's vocabulary and a
+  CI check asserting the two literal sets are equal, closing the drift class in vikunja#324
+  rather than adding a second instance of it. A vocabulary change here will turn that
+  repository's pipeline red until its copy is updated. That is the alarm, not a malfunction.
+
 ## [0.8.2] - 2026-08-16
 
 ### Fixed

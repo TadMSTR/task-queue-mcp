@@ -11,9 +11,12 @@ from src.tools.queue import (
     MAX_AMENDMENTS,
     NON_TERMINAL_STATUSES,
     OPERATOR_ACTOR,
+    SELF_TERMINAL_TASK_TYPES,
     TERMINAL_STATUSES,
     VALID_STATUSES,
+    VALID_TASK_TYPES,
     VALID_TRANSITIONS,
+    VALID_WORKFLOW_MODES,
     amend_task_handler,
     cancel_task_handler,
     get_task_handler,
@@ -1917,3 +1920,224 @@ def test_auto_close_note_carries_the_return_task_summary(tmp_path):
     closed = get_task_handler(task_id=parent["task_id"], queue_dir=str(tmp_path))
     assert closed["status"] == "completed"
     assert "Audit complete: 0 critical, 1 medium" in closed["history"][-1]["note"]
+
+
+# ---------------------------------------------------------------------------
+# Self-terminal `notify` tasks (vikunja#507)
+#
+# A notification is recorded and closed on delivery: no `submitted` row for the
+# dispatcher to launch, no `approved` row for an agent to claim, nothing for anyone
+# to close. Everything below is about that write being terminal AND still honest —
+# the auto-close it triggers, the approval it refuses, the transitions it must not
+# have widened.
+# ---------------------------------------------------------------------------
+
+
+def _notify(tmp_path, **kwargs) -> dict:
+    defaults = dict(
+        source_agent="security",
+        target_agent="steward",
+        task_type="notify",
+        summary="Countersigned 2026-08-27-example: approve",
+        description="verdict: approve\nnothing further required",
+    )
+    defaults.update(kwargs)
+    return make_task(tmp_path, **defaults)
+
+
+def test_notify_is_written_terminal(tmp_path):
+    result = _notify(tmp_path)
+    assert result["ok"] is True
+    assert result["status"] == "completed"
+    assert result["self_terminal"] is True
+
+    task = yaml.safe_load((tmp_path / result["filename"]).read_text())
+    assert task["task_type"] == "notify"
+    assert task["status"] == "completed"
+    assert task["status"] in TERMINAL_STATUSES
+
+
+def test_notify_populates_the_result_block(tmp_path):
+    result = _notify(tmp_path, description="verdict: approve")
+
+    task = yaml.safe_load((tmp_path / result["filename"]).read_text())
+    assert task["result"]["output"] == "verdict: approve"
+    assert task["result"]["completed_by"] == "security (notify)"
+    assert task["result"]["completed_at"] is not None
+    assert task["result"]["completed_at"] == task["created"]
+
+
+def test_notify_history_records_delivery_not_teleportation(tmp_path):
+    """The trail must read submitted → completed, not spring into existence finished."""
+    result = _notify(tmp_path)
+
+    task = yaml.safe_load((tmp_path / result["filename"]).read_text())
+    assert [h["status"] for h in task["history"]] == ["submitted", "completed"]
+    assert task["history"][-1]["actor"] == "security"
+    assert "no session required" in task["history"][-1]["note"]
+
+
+def test_notify_forces_requires_approval_false(tmp_path):
+    """Honouring it would produce a terminal task awaiting approval — unreachable."""
+    result = _notify(tmp_path, requires_approval=True)
+
+    task = yaml.safe_load((tmp_path / result["filename"]).read_text())
+    assert task["requires_approval"] is False
+    # The override is recorded, not silent: the record must not simply disagree with
+    # the call that made it.
+    assert "requires_approval=True ignored" in task["history"][-1]["note"]
+
+
+def test_notify_without_approval_request_has_no_override_note(tmp_path):
+    task = yaml.safe_load((tmp_path / _notify(tmp_path)["filename"]).read_text())
+    assert "ignored" not in task["history"][-1]["note"]
+
+
+def test_non_notify_types_are_untouched(tmp_path):
+    """The whole point is that this is a `notify`-only path."""
+    for task_type in ("build", "audit", "review", "docs", "ticket_audit_complete"):
+        result = make_task(tmp_path, task_type=task_type, requires_approval=True)
+        task = yaml.safe_load((tmp_path / result["filename"]).read_text())
+        assert task["status"] == "submitted", task_type
+        assert task["requires_approval"] is True, task_type
+        assert task["result"]["output"] is None, task_type
+        assert task["result"]["completed_by"] is None, task_type
+        assert len(task["history"]) == 1, task_type
+        assert "status" not in result, task_type
+        assert "self_terminal" not in result, task_type
+
+
+def test_notify_still_auto_closes_its_parent(tmp_path):
+    """
+    The terminal write must not short-circuit the auto-close.
+
+    This is the interaction the whole design depends on: the notification closes the
+    request it answers (mid-chain, already working) AND closes itself (new). If the
+    terminal write ever moved above `_auto_close_originating_task`, or replaced the
+    return path, the parent would be stranded exactly as before.
+    """
+    parent = _request_task(tmp_path, target="security", source="steward")
+
+    child = _notify(tmp_path, target_agent="steward", originating_task_id=parent["task_id"])
+    assert child["auto_closed_task_id"] == parent["task_id"]
+    assert child["status"] == "completed"
+
+    closed = get_task_handler(parent["task_id"], queue_dir=str(tmp_path))
+    assert closed["status"] == "completed"
+    assert child["task_id"] in closed["history"][-1]["note"]
+
+    # Both legs closed — nothing left open anywhere in the chain.
+    assert yaml.safe_load((tmp_path / child["filename"]).read_text())["status"] == "completed"
+
+
+def test_notify_does_not_appear_in_the_approved_work_list(tmp_path):
+    """
+    The bound that makes forcing requires_approval=False safe: a notify task is never
+    `approved`, so it cannot reach the sweep every agent uses to find its work.
+    """
+    _notify(tmp_path, target_agent="steward")
+    work_list = list_tasks_handler(
+        target_agent="steward", status="approved", queue_dir=str(tmp_path)
+    )
+    assert work_list == []
+
+    # It IS readable — the point is delivery, not concealment.
+    visible = list_tasks_handler(target_agent="steward", queue_dir=str(tmp_path))
+    assert [t["task_type"] for t in visible] == ["notify"]
+
+
+def test_notify_did_not_widen_the_agent_transitions(tmp_path):
+    """
+    `completed` from `submitted` is legal for this creation path and must stay illegal
+    as an agent move. TERMINAL_STATUSES and friends have a documented history of silent
+    widening; this asserts the new path did not become a back door into update_task.
+    """
+    assert "submitted" not in VALID_TRANSITIONS["completed"]
+    assert VALID_TRANSITIONS["completed"] == {"in-progress"}
+
+    plain = make_task(tmp_path, task_type="build")
+    result = update_task_handler(
+        task_id=plain["task_id"], status="completed", actor="dev", queue_dir=str(tmp_path)
+    )
+    assert result["ok"] is False
+    assert "Invalid transition" in result["error"]
+
+
+def test_notify_is_immutable_once_delivered(tmp_path):
+    """It is terminal, so the existing immutability rule applies with no special case."""
+    result = _notify(tmp_path)
+    update = update_task_handler(
+        task_id=result["task_id"], status="failed", actor="steward", queue_dir=str(tmp_path)
+    )
+    assert update["ok"] is False
+
+
+def test_self_terminal_vocabulary_is_exactly_notify():
+    """
+    Every type in this set skips approval and skips the dispatcher. Widening it is a
+    security decision, not a convenience — an ACTIONABLE type added here would stop
+    reaching anyone's work list while still looking like it had been filed.
+    """
+    assert SELF_TERMINAL_TASK_TYPES == {"notify"}
+    assert SELF_TERMINAL_TASK_TYPES < VALID_TASK_TYPES
+
+
+def test_notify_still_validates_its_inputs(tmp_path):
+    """Self-terminal is not a validation bypass."""
+    assert _notify(tmp_path, risk_level="catastrophic")["ok"] is False
+    assert _notify(tmp_path, priority="whenever")["ok"] is False
+    assert _notify(tmp_path, context_refs=["relative/path"])["ok"] is False
+    assert _notify(tmp_path, summary="  ")["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# `manual-then-auto` workflow mode (vikunja#533)
+#
+# This module only has to make the value expressible — the downgrade that gives it
+# meaning lives in task-dispatcher.py's child_workflow_mode(). What is asserted here
+# is the vocabulary and the fact that nothing else changed shape.
+# ---------------------------------------------------------------------------
+
+
+def test_submit_accepts_manual_then_auto(tmp_path):
+    result = make_task(tmp_path, workflow_mode="manual-then-auto")
+    assert result["ok"] is True
+
+    task = yaml.safe_load((tmp_path / result["filename"]).read_text())
+    assert task["workflow_mode"] == "manual-then-auto"
+
+    # It survives the round trip through both read paths the dispatcher and the plugin use.
+    assert get_task_handler(result["task_id"], queue_dir=str(tmp_path))["workflow_mode"] == (
+        "manual-then-auto"
+    )
+    assert list_tasks_handler(queue_dir=str(tmp_path))[0]["workflow_mode"] == "manual-then-auto"
+
+
+def test_manual_then_auto_is_not_stored_pre_downgraded(tmp_path):
+    """
+    The mode is a property of the chain, so the parent must keep it verbatim. If this
+    module downgraded on write, the dispatcher would have nothing left to gate on and
+    `manual-then-auto` would behave as plain `auto` — the exact failure the mode exists
+    to prevent.
+    """
+    result = make_task(tmp_path, workflow_mode="manual-then-auto")
+    assert yaml.safe_load((tmp_path / result["filename"]).read_text())["workflow_mode"] != "auto"
+
+
+def test_workflow_mode_vocabulary_is_exactly_three(tmp_path):
+    """
+    A guard against silent widening, in the spirit of the VALID_TRANSITIONS literal.
+    `manual` in particular has never been valid here despite run-steward.sh accepting it
+    for months — if it ever appears in this set it should be a deliberate change, not a
+    side effect.
+    """
+    assert VALID_WORKFLOW_MODES == {"semi-auto", "auto", "manual-then-auto"}
+    assert "manual" not in VALID_WORKFLOW_MODES
+
+
+def test_submit_rejects_manual(tmp_path):
+    """The negative test from the plan: `manual` is the launcher's word, not the queue's."""
+    result = make_task(tmp_path, workflow_mode="manual")
+    assert result["ok"] is False
+    assert "Invalid workflow_mode" in result["error"]
+    assert "manual-then-auto" in result["error"]
