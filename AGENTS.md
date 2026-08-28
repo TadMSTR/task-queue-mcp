@@ -16,13 +16,17 @@ submitted ──▶ approved ──────────▶ in-progress ─�
                                                     routing-failed (non-terminal, dispatcher-written;
                                                                     operator can cancel/park/re-submit it,
                                                                     agents cannot reach it via update_task)
+
+submitted ══▶ completed   (task_type=notify only — a creation path, not a transition;
+                            written directly by submit_task, never via update_task.
+                            VALID_TRANSITIONS["completed"] is still exactly {"in-progress"}.)
 ```
 
-Terminal statuses: `completed`, `failed`, `cancelled`. Transitions are validated server-side; agents cannot claim (`in-progress`) a task that is not `approved`.
+Terminal statuses: `completed`, `failed`, `cancelled`. Transitions are validated server-side; agents cannot claim (`in-progress`) a task that is not `approved`. The one exception is by construction, not transition: a `notify` task is written straight to `completed` at submit time and never passes through `approved` or `in-progress` at all.
 
 ## Tools
 
-- `submit_task(source_agent, target_agent, task_type, summary, description, ...)` — Write a YAML task file to `TASK_QUEUE_DIR` (initial status `submitted`). Returns `{ok, task_id, filename}`.
+- `submit_task(source_agent, target_agent, task_type, summary, description, ...)` — Write a YAML task file to `TASK_QUEUE_DIR` (initial status `submitted`, except `task_type="notify"`, which is written straight to `completed` — see the lifecycle diagram above). Returns `{ok, task_id, filename}`.
 - `list_tasks(target_agent, source_agent, status, limit)` — Filter tasks from the queue directory.
 - `get_task(task_id)` — Retrieve a single task by ID.
 - `update_task(task_id, status, ...)` — Move a task to `in-progress`, `completed`, or `failed` (records actor/note/history).

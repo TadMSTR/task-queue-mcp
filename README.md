@@ -42,13 +42,21 @@ submit_task(
     priority="normal",  # normal | high | urgent (default: normal)
     context_refs=["/srv/agents/build-plans/qmd/plan.md"],  # absolute paths only
     ttl_days=30,
-    workflow_mode="semi-auto",  # semi-auto | auto (default: semi-auto)
+    workflow_mode="semi-auto",  # semi-auto | auto | manual-then-auto (default: semi-auto)
     originating_task_id=None,  # UUID of the parent task, if this is a return task
 )
 # → {"ok": true, "task_id": "<uuid>", "filename": "<timestamp>-<slug>.yml"}
 ```
 
-`context_refs` must be absolute paths. `risk_level` and `priority` are validated against allowlists. `workflow_mode` controls dispatcher behavior: `semi-auto` (default) queues the task for operator pickup with a Matrix notification, while `auto` triggers the dispatcher to launch the target agent headlessly. The server generates the UUID, sets `created`, and initializes the `retry_policy` stub.
+`context_refs` must be absolute paths. `risk_level` and `priority` are validated against allowlists. `workflow_mode` controls dispatcher behavior: `semi-auto` (default) queues the task for operator pickup with a Matrix notification, while `auto` triggers the dispatcher to launch the target agent headlessly. `manual-then-auto` gates only its own leg — this task waits for an operator Start exactly like `semi-auto`, but every task the resulting session spawns inherits `auto`. The mode is stored verbatim on the parent task; the downgrade to `auto` for children happens in the dispatcher, not here, so a reader inspecting the stored YAML sees `manual-then-auto` unchanged. The server generates the UUID, sets `created`, and initializes the `retry_policy` stub.
+
+#### `notify` is self-terminal
+
+`submit_task` writes a `notify` task straight to `completed` — `result.output` carries the description, `result.completed_by` is `<source_agent> (notify)`, no agent session is ever launched, and nobody has to close it. `requires_approval` is forced `False` for the type.
+
+Use `notify` for "here is a result, nothing to do" — a verdict, an outcome, an FYI. Do **not** use it to ask for work: a `notify` task is never `approved`, so it never appears in the `list_tasks(status="approved")` sweep agents use as a work list, and a request filed that way vanishes without an error. It remains visible to an unfiltered `list_tasks` until its TTL — readable, not assignable.
+
+Submitting a `notify` still auto-closes the request it answers via `originating_task_id`, exactly as any other return task does — see [Auto-close](#auto-close-of-the-originating-task-since-v060) below.
 
 #### Auto-close of the originating task (since v0.6.0)
 
