@@ -48,6 +48,19 @@ visible and recoverable.
   here however its id is spelled. A dead letter's `failed` is the dispatcher's record of
   exhausting its retries, not an agent's judgement that the work is over.
 
+### Security
+- Audited 2026-08-29 (`agent-workflow-interop-2026-08-phase1`): no Critical/High/Medium
+  findings, nothing to remediate. The new `requeue_dead_letter` primitive was confirmed
+  bounded on all three axes it claims — operator-only at the MCP layer, scoped to
+  `dead-letters/` alone at the handler layer, and absent from every one of the nine live
+  agent manifests' tool allowlists.
+- Two no-action findings are recorded **in the source** rather than only in the report,
+  because both are traps for whoever edits these lines next: a `SECURITY[accepted]` block on
+  requeue's destination collision check naming the `os.path.exists`/`os.rename` TOCTOU
+  precisely (hardening the check in place does **not** close it), and a note on
+  `DEAD_LETTER_DIRNAME` that it is an ungated cross-repo literal shared with
+  `task-dispatcher`, to be gated by Phase 5's vocabulary machinery.
+
 ### Fixed
 - **Dead letters are exempt from the TTL filter in `list_tasks`.** They carry terminal
   `failed`, and every one of the seventeen is past its `ttl_days` — the newest by a month,

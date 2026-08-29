@@ -152,6 +152,18 @@ OPERATOR_ACTOR = "operator"
 #
 # The directory names are the dispatcher's — task_dispatcher.cli.DEAD_LETTER_DIR and
 # ARCHIVE_DIR — and this module is the reader of what that writer produces.
+#
+# THESE TWO LITERALS ARE AN UNGATED CROSS-REPO CONTRACT. `task-dispatcher` owns
+# `DEAD_LETTER_DIR = TASK_QUEUE_DIR / "dead-letters"`; this module now names the same string
+# on the reader side. They are byte-identical today (verified), and nothing checks that they
+# stay so. If the writer's name ever changes without a matching change here, `get_task` and
+# `list_tasks` silently stop finding new dead letters — which is precisely the failure this
+# build exists to end, recurring one layer down.
+#
+# Deliberately NOT gated in Phase 1: task-dispatcher is outside this phase's file set, and a
+# gate needs the machinery Phase 5 is already building for the agent-bus vocabulary. Fold it
+# in there. (audit 2026-08-29/agent-workflow-interop-2026-08-phase1, INFO, no action for
+# Phase 1; parent plan's shared contract #1 — "task-queue YAML schema, gate: none".)
 ARCHIVE_DIRNAME = "archive"
 DEAD_LETTER_DIRNAME = "dead-letters"
 
@@ -1375,6 +1387,26 @@ def requeue_dead_letter_handler(
         # A live file under the same name means some other record already occupies this
         # slot in the queue root. Overwriting it would destroy live work to recover dead
         # work, so refuse and let an operator look.
+        #
+        # SECURITY[accepted]: this is a check-then-act, not an atomic guard. `_task_lock`
+        # is keyed on the DEAD-LETTERED TASK'S id, not on `dest`, so it serialises against
+        # another requeue of this same task and nothing else. Between this `os.path.exists`
+        # and the `os.rename` inside `_write_task_atomic` — which overwrites unconditionally
+        # on POSIX — another writer (most plausibly `submit_task`) could create `dest`, and
+        # the rename would clobber it silently.
+        #
+        # Accepted because the window is bounded by filename entropy: names are
+        # `<YYYYMMDD-HHMMSS>-<id8>.yml`, so a real collision needs the same second AND the
+        # same 8 hex characters of a different UUID, which in practice means the same task.
+        # It is also not attacker-reachable — requeue is operator-only and `dead-letters/`
+        # is not agent-writable — so the exposure is data integrity, not privilege.
+        #
+        # NOTE FOR WHOEVER TOUCHES THIS NEXT: wrapping the existence check in a try/except,
+        # or hardening it in place, does NOT close the gap. Only a lock keyed on `dest`, or
+        # an `O_EXCL` create of `dest` before the write, would. Do not read the presence of
+        # this check as evidence the race is handled.
+        # (audit 2026-08-29/agent-workflow-interop-2026-08-phase1, F-01 LOW, confirmed
+        # no-action; originally self-flagged in the audit request's Known Risks #3.)
         if os.path.exists(dest):
             return {
                 "ok": False,
