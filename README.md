@@ -13,13 +13,14 @@ Runs as a Docker container on port 8485. Wired globally into `~/.claude.json` so
 |------|-------------|
 | `submit_task` | Create a new task with `status: submitted` |
 | `list_tasks` | List tasks with optional filters; TTL-expired tasks excluded |
-| `get_task` | Retrieve a single task by UUID (resolves archived tasks too) |
+| `get_task` | Retrieve a single task by UUID (resolves archived and dead-lettered tasks too) |
 | `update_task` | Agent-facing status transition (strict); appends a history entry |
 | `set_task_status` | Operator status change — approve, cancel, park, or advance a missed task (audited override) |
 | `cancel_task` | Graceful terminal `cancelled` state for stale tasks (record kept, never deleted) |
 | `park_task` | Pause a task without hiding it — stays listed, exempt from TTL, nothing picks it up |
 | `unpark_task` | Return a parked task to the status it was parked from |
 | `amend_task` | Append a correction to a queued task; the original description is never rewritten |
+| `requeue_dead_letter` | Operator-only — return a dead-lettered task to the queue at `submitted` |
 
 Agents use the strict `update_task` path; operators (via the HTTP control API) use
 `set_task_status` / `cancel_task` / `park_task` / `unpark_task`. Agents cannot cancel or
@@ -93,6 +94,7 @@ list_tasks(
     status="approved,in-progress",  # comma-separated, optional
     task_type="build",  # optional
     include_archived=False,  # include archive/ subdirectory
+    include_dead_letters=False,  # include dead-letters/ subdirectory
     limit=20,  # max 200
 )
 # → list of task dicts, sorted by created descending
@@ -106,6 +108,17 @@ Non-terminal tasks are **never** TTL-filtered (since v0.8.1, vikunja#395). Open 
 
 **Parked tasks are exempt from the TTL filter.** Parking is a deliberate "pause this, I'll come back to it" — a parked task quietly expiring out of the listing would defeat the point of the status.
 
+Every returned record carries **`queue_location`** — `"queue"`, `"archive"` or `"dead-letters"` — so a caller can tell a dead letter from live work without inspecting file paths (which it never sees).
+
+#### Dead letters (since v0.10.0)
+
+`include_dead_letters=True` also returns records the dispatcher gave up routing and moved to `dead-letters/`. It is **off by default and does not follow `include_archived`**: every agent's work sweep is a `list_tasks` call, and a dead letter is a task nothing can route, so folding them into the default listing would hand each agent a backlog it cannot act on. Visibility is the point, not re-delivery.
+
+Two things make the flag actually work against a real queue, and both were found by running it against one:
+
+- **Dead letters are exempt from the TTL filter.** A dead letter carries `failed` — terminal — and the seventeen on forge are between one and three months past their `ttl_days`. Without the exemption the flag returns an empty list, which reads as "there are none".
+- **Dead letters sort first when included.** A dead letter is among the oldest records in the queue by construction; under a plain created-descending sort all seventeen land behind several hundred live tasks and `limit` discards every one. Measured: `include_dead_letters=True, limit=200` returned 200 rows and zero dead letters before this. Ordering *within* each group is unchanged.
+
 ### get_task
 
 ```python
@@ -113,7 +126,11 @@ get_task(task_id="a7f3d2c1-1234-5678-abcd-000000000000")
 # → full task dict, or {"ok": false, "error": "not found"}
 ```
 
-Searches the main queue first, then `archive/`. Requires a full UUID — no prefix matching.
+Searches the main queue first, then `archive/`, then `dead-letters/`. Requires a full UUID — no prefix matching.
+
+A dead-lettered record comes back with its `failed_reason` block intact and `queue_location: "dead-letters"`. Unlike `list_tasks`, this needs no opt-in: asking for a task by id is not a work sweep, it is someone holding a specific id and wanting to know what became of it. Answering `not found` for a record sitting on disk was the bug — a dropped audit request looked identical to an id that never existed.
+
+A dead letter cannot be transitioned in place. `update_task`, `set_task_status`, `park_task`/`unpark_task` and `amend_task` do not load `dead-letters/` at all — that absence *is* the gate — and refuse by name (`task is dead-lettered and cannot be mutated in place`) rather than answering `not found`. The one way out is `requeue_dead_letter`.
 
 ### update_task
 
@@ -244,7 +261,8 @@ Non-MCP clients (the CloudCLI plugin and Matrix bot) can't import the Python cor
 | `POST` | `/tasks/{id}/unpark` | `unpark_task` (body: optional `status`) |
 | `POST` | `/tasks/{id}/amend` | `amend_task` (body: `amendment`, optional `reason`) |
 | `POST` | `/tasks/{id}/update` | `update_task` (body: `status`, `note`, `output`, optional `on_behalf_of`) |
-| `GET` | `/queue/summary` | Counts by status across the active queue |
+| `POST` | `/tasks/{id}/requeue` | `requeue_dead_letter` (body: optional `note`) |
+| `GET` | `/queue/summary` | Counts by status across the active queue, plus `dead_letters` |
 
 Body fields: `note`, plus `status` / `allow_override` for the status route, `amendment` / `reason` for amend, `status` / `output` / `on_behalf_of` for update. Responses map the canonical result: `200` ok, `404` not found, `400` validation/transition error.
 
@@ -267,7 +285,19 @@ history:
 
 A sweep should read as a sweep years later, not as the agent having quietly closed its own work. `on_behalf_of` is optional — omitting it is the operator acting in its own name — and is refused outright for any non-`operator` actor.
 
-`GET /queue/summary` returns `{"ok": true, "counts": {...}, "active": N, "total": N}`, where `active` is the non-terminal total (now including `routing-failed`, counted by name). Statuses outside the server's vocabulary entirely are bucketed under `"unknown"` rather than dropped, so records written by other direct-YAML writers stay visible in the count.
+`GET /queue/summary` returns `{"ok": true, "counts": {...}, "active": N, "total": N, "dead_letters": N}`, where `active` is the non-terminal total (now including `routing-failed`, counted by name). Statuses outside the server's vocabulary entirely are bucketed under `"unknown"` rather than dropped, so records written by other direct-YAML writers stay visible in the count.
+
+`dead_letters` is a **sibling** of `counts`, not a member of it (since v0.10.0). Every dead letter carries `failed`, so folding them into the status histogram would bury them among genuinely finished work — the same invisibility, one field along. `counts`, `active` and `total` all describe the active queue only.
+
+### Recovering a dead letter — `POST /tasks/{id}/requeue`
+
+Moves the record back to the queue root at `submitted`, drops `failed_reason`, and resets `retry_policy` to `{next_retry_at: null, retry_count: 0}`. `created` is **not** refreshed — when the work was first asked for is the record, and rewriting it to make a three-month-old dropped audit look new is the flavour of tidiness that made the backlog invisible. `alert_state` is left alone; the dispatcher owns it. The history entry records `action: requeue`, the actor, and `cleared_failed_reason`, so a second drop does not read as a first.
+
+**Operator-only**, the same gate as `set_task_status`: if an agent could requeue its own dead letters, a routing bug that drops a task becomes an agent-driven retry loop and the dispatcher's retry ceiling bounds nothing.
+
+**Terminal immutability is not weakened.** The handler looks the record up *only* under `dead-letters/`, so a `failed` task in the queue root or in `archive/` is unreachable here however its id is spelled. A dead letter's `failed` is the dispatcher's record of exhausting its retries, not an agent's judgement that the work is over.
+
+Requeueing does not fix *why* a task was dropped. Sending one of the seventeen back through the routing that rejected it will dead-letter it again after three retries — that root cause is vikunja#63/#169.
 
 **Auth:** custom routes bypass the transport's bearer auth, so a shared-secret header is the gate — and these routes are deliberately outside it, because they are the operator surface:
 
@@ -405,7 +435,7 @@ This covers `source_agent` on `submit_task` too, which is an identity claim and 
 | `update_task` | the task's `target_agent`, or the operator |
 | `park_task`, `unpark_task` | the task's `target_agent`, or the operator |
 | `amend_task` | the task's `source_agent`, or the operator |
-| `set_task_status`, `cancel_task` | **operator only** — refused for any agent identity |
+| `set_task_status`, `cancel_task`, `requeue_dead_letter` | **operator only** — refused for any agent identity |
 
 `set_task_status` is operator-only because its `allow_override` path moves a task between any two non-terminal statuses, which is how a task gets walked around a transition rule instead of satisfying it. `cancel_task` is a terminal, irreversible judgement about someone else's work; an agent abandoning its own task marks it `failed` with a reason via `update_task`.
 

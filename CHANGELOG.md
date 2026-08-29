@@ -4,6 +4,74 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-29
+
+Make the dead-letter path visible. Build `agent-workflow-interop-2026-08` Phase 1;
+vikunja#557.
+
+`~/.claude/task-queue/dead-letters/` is written by task-dispatcher when a task exhausts its
+routing retries. Nothing in this server could read it: `get_task` searched the queue root
+then `archive/` and returned `not found`, `list_tasks` globbed the root, `/queue/summary`
+counted the root. Seventeen tasks accumulated there between 2026-05-29 and 2026-07-25 —
+every one a security audit request, all seventeen carrying the identical `failed_reason`
+(`Invalid or missing build_name in payload: 'unknown'`) — and the only notice any of them
+ever got was a single Matrix message at the moment it was dropped. A known bug quietly ate
+seventeen security audits over three months and no interface could show it.
+
+The root cause is **not** fixed here — that is vikunja#63/#169. This makes the damage
+visible and recoverable.
+
+### Added
+- **`get_task` resolves `dead-letters/`**, after the queue root and `archive/`. No opt-in:
+  asking for a task by id is not a work sweep, it is someone holding a specific id and
+  wanting to know what became of it. The record keeps its `failed_reason` block.
+- **`queue_location` on every record** returned by `get_task` and `list_tasks` — `"queue"`,
+  `"archive"` or `"dead-letters"`. A caller must be able to tell a dead letter from live
+  work without inspecting file paths, which it never sees.
+- **`list_tasks(include_dead_letters=True)`**, off by default and deliberately *not*
+  implied by `include_archived`. Every agent's work sweep is a `list_tasks` call, and a
+  dead letter is a task nothing can route: folding them into the default listing would hand
+  each agent a backlog it cannot act on. Visibility, not re-delivery.
+- **`dead_letters` in `GET /queue/summary`**, as a sibling of `counts` rather than a member.
+  Every dead letter carries `failed`, so counting them by status would bury them among
+  genuinely finished work — the same invisibility, one field along.
+- **`requeue_dead_letter` tool and `POST /tasks/{id}/requeue` route.** Moves the record back
+  to the queue root at `submitted`, drops `failed_reason`, resets `retry_policy`, and
+  appends a history entry carrying `action: requeue` and `cleared_failed_reason` so a second
+  drop does not read as a first. `created` is not refreshed and `alert_state` is untouched.
+
+  **Operator-only**, the same gate as `set_task_status`. An agent that could requeue its own
+  dead letters turns a routing bug into an agent-driven retry loop with nothing bounding it.
+
+  It is the only path in this server that walks a record out of a terminal status, and it is
+  scoped to one directory: a `failed` task in the queue root or in `archive/` is unreachable
+  here however its id is spelled. A dead letter's `failed` is the dispatcher's record of
+  exhausting its retries, not an agent's judgement that the work is over.
+
+### Fixed
+- **Dead letters are exempt from the TTL filter in `list_tasks`.** They carry terminal
+  `failed`, and every one of the seventeen is past its `ttl_days` — the newest by a month,
+  the oldest by three. Without the exemption `include_dead_letters=True` returns an empty
+  list against the only queue that has any, which reads as "there are none". Same reasoning
+  as vikunja#395: ageing out is for finished work, and a dead letter is unfinished work with
+  no route.
+- **Dead letters sort first when included.** Found by running the flag against the live
+  queue: `include_dead_letters=True, limit=200` returned 200 rows and *zero* dead letters. A
+  dead letter is among the oldest records in the queue by construction, so under a plain
+  created-descending sort all seventeen land behind several hundred live tasks and the limit
+  discards them. Ordering within each group is unchanged.
+- **The mutating handlers name the state they are refusing.** `update_task`,
+  `set_task_status`, `unpark_task` and `amend_task` do not load `dead-letters/` at all —
+  that absence is what keeps a dead letter unreachable from every ordinary transition — but
+  it meant each of them answered `not found` for a record `get_task` would happily return.
+  They now refuse by name and point at the requeue path.
+- **`_write_task_atomic` strips every `_`-prefixed key, not just `_path`.** The handlers pop
+  `_path` and hand the rest of the loaded dict straight to the writer, so the new
+  `_location` annotation would have been serialised into the YAML on the next transition.
+  Filtering the class rather than naming one member closes it for the next annotation too.
+- **Archive detection reads `_location`, not `"archive" in _path`.** The substring test
+  would have matched any queue directory with `archive` anywhere in its path.
+
 ## [0.9.0] - 2026-08-27
 
 Two changes so an operator can start a headless chain once and have it run and close

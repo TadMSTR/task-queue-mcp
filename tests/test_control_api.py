@@ -36,6 +36,37 @@ def client(env):
         yield c
 
 
+def _dead_letter(tmp_path, result):
+    """Relocate a task to dead-letters/ the way task-dispatcher's move_to_dead_letter does."""
+    src = tmp_path / result["filename"]
+    data = yaml.safe_load(src.read_text())
+    data["status"] = "failed"
+    data["failed_reason"] = {
+        "timestamp": "2026-05-29T12:34:00.126757+00:00",
+        "reason": "Invalid or missing build_name in payload: 'unknown'",
+        "retry_count": 3,
+    }
+    dead = tmp_path / "dead-letters"
+    dead.mkdir(exist_ok=True)
+    (dead / result["filename"]).write_text(
+        yaml.dump(data, default_flow_style=False, sort_keys=False)
+    )
+    src.unlink()
+    return result["task_id"]
+
+
+def _seed_result(tmp_path):
+    """`_seed` returns only the id; the dead-letter helpers need the filename too."""
+    return submit_task_handler(
+        source_agent="research",
+        target_agent="developer",
+        task_type="build",
+        summary="s",
+        description="d",
+        queue_dir=str(tmp_path),
+    )
+
+
 def _seed(tmp_path, status=None):
     r = submit_task_handler(
         source_agent="research",
@@ -289,6 +320,121 @@ def test_queue_summary_counts_routing_failed_as_active(env, client):
 def test_queue_summary_requires_secret(env, client):
     resp = client.get("/queue/summary")
     assert resp.status_code == 401
+
+
+def test_queue_summary_reports_dead_letters(env, client):
+    """
+    The count that did not exist. Seventeen dead letters were absent from every number
+    this route produced, which is precisely how they accumulated for three months without
+    anyone noticing. (vikunja#557)
+    """
+    _, tmp_path = env
+    _seed(tmp_path)
+    for _ in range(3):
+        _dead_letter(tmp_path, _seed_result(tmp_path))
+
+    body = client.get("/queue/summary", headers=AUTH).json()
+
+    assert body["dead_letters"] == 3
+
+
+def test_queue_summary_keeps_dead_letters_out_of_the_status_histogram(env, client):
+    """
+    Every dead letter carries `failed`. Folding them into `counts` would bury them among
+    genuinely finished work — the same invisibility, one field along. `counts`, `active`
+    and `total` describe the ACTIVE queue; `dead_letters` is its own key.
+    """
+    _, tmp_path = env
+    _seed(tmp_path)
+    _dead_letter(tmp_path, _seed_result(tmp_path))
+
+    body = client.get("/queue/summary", headers=AUTH).json()
+
+    assert body["counts"] == {"submitted": 1}
+    assert body["total"] == 1
+    assert body["active"] == 1
+    assert body["dead_letters"] == 1
+
+
+def test_queue_summary_reports_zero_dead_letters_when_there_are_none(env, client):
+    _, tmp_path = env
+    _seed(tmp_path)
+
+    assert client.get("/queue/summary", headers=AUTH).json()["dead_letters"] == 0
+
+
+# ── requeue ────────────────────────────────────────────────────────────
+
+
+def test_requeue_moves_the_task_back_into_the_queue(env, client):
+    _, tmp_path = env
+    r = _seed_result(tmp_path)
+    tid = _dead_letter(tmp_path, r)
+
+    resp = client.post(f"/tasks/{tid}/requeue", headers=AUTH, json={"note": "root cause fixed"})
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert (tmp_path / r["filename"]).is_file()
+    assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "submitted"
+
+
+def test_requeue_records_the_operator_as_the_actor(env, client):
+    """
+    The route pins `actor` rather than reading it from the body, like every other mutation
+    route here — a caller must not be able to attribute a resurrection to someone else.
+    """
+    _, tmp_path = env
+    tid = _dead_letter(tmp_path, _seed_result(tmp_path))
+
+    client.post(f"/tasks/{tid}/requeue", headers=AUTH, json={"actor": "security", "note": "n"})
+
+    entry = get_task_handler(task_id=tid, queue_dir=str(tmp_path))["history"][-1]
+    assert entry["actor"] == "operator"
+    assert entry["action"] == "requeue"
+
+
+def test_requeue_requires_the_secret(env, client):
+    _, tmp_path = env
+    r = _seed_result(tmp_path)
+    tid = _dead_letter(tmp_path, r)
+
+    resp = client.post(f"/tasks/{tid}/requeue", json={"note": "n"})
+
+    assert resp.status_code == 401
+    assert not (tmp_path / r["filename"]).exists()
+    assert (tmp_path / "dead-letters" / r["filename"]).is_file()
+
+
+def test_requeue_wrong_secret_is_rejected(env, client):
+    _, tmp_path = env
+    r = _seed_result(tmp_path)
+    tid = _dead_letter(tmp_path, r)
+
+    resp = client.post(f"/tasks/{tid}/requeue", headers={"X-Task-Queue-Secret": "wrong"}, json={})
+
+    assert resp.status_code == 401
+    assert (tmp_path / "dead-letters" / r["filename"]).is_file()
+
+
+def test_requeue_of_a_live_task_is_404(env, client):
+    """Terminal immutability is untouched: only dead-letters/ is reachable from here."""
+    _, tmp_path = env
+    tid = _seed(tmp_path, status="failed")
+
+    resp = client.post(f"/tasks/{tid}/requeue", headers=AUTH, json={})
+
+    assert resp.status_code == 404
+    assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "failed"
+
+
+def test_requeue_tolerates_an_empty_body(env, client):
+    _, tmp_path = env
+    tid = _dead_letter(tmp_path, _seed_result(tmp_path))
+
+    resp = client.post(f"/tasks/{tid}/requeue", headers=AUTH)
+
+    assert resp.status_code == 200
 
 
 # ── error surfacing ────────────────────────────────────────────────────
