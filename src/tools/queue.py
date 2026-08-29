@@ -137,6 +137,45 @@ MAX_AMENDMENT_CHARS = 4096
 # depend on a server framework for a string. queue -> auth -> server has no cycle.
 OPERATOR_ACTOR = "operator"
 
+# ---------------------------------------------------------------------------
+# Where a record lives
+# ---------------------------------------------------------------------------
+#
+# The queue is three directories, not one. Until now only two of them were reachable:
+# `get_task` searched the root then `archive/`, `list_tasks` searched the root, and
+# `/queue/summary` counted the root. `dead-letters/` — written by the dispatcher when a
+# task exhausts its routing retries — was addressable by no tool at all. Seventeen tasks
+# accumulated there between 2026-05-29 and 2026-07-25, every one of them a security audit
+# request, all seventeen carrying the identical `failed_reason`, and the only notice any of
+# them ever got was a single Matrix message at the moment it was dropped.
+# A failure path nothing can enumerate is a failure path nobody checks. (vikunja#557)
+#
+# The directory names are the dispatcher's — task_dispatcher.cli.DEAD_LETTER_DIR and
+# ARCHIVE_DIR — and this module is the reader of what that writer produces.
+#
+# THESE TWO LITERALS ARE AN UNGATED CROSS-REPO CONTRACT. `task-dispatcher` owns
+# `DEAD_LETTER_DIR = TASK_QUEUE_DIR / "dead-letters"`; this module now names the same string
+# on the reader side. They are byte-identical today (verified), and nothing checks that they
+# stay so. If the writer's name ever changes without a matching change here, `get_task` and
+# `list_tasks` silently stop finding new dead letters — which is precisely the failure this
+# build exists to end, recurring one layer down.
+#
+# Deliberately NOT gated in Phase 1: task-dispatcher is outside this phase's file set, and a
+# gate needs the machinery Phase 5 is already building for the agent-bus vocabulary. Fold it
+# in there. (audit 2026-08-29/agent-workflow-interop-2026-08-phase1, INFO, no action for
+# Phase 1; parent plan's shared contract #1 — "task-queue YAML schema, gate: none".)
+ARCHIVE_DIRNAME = "archive"
+DEAD_LETTER_DIRNAME = "dead-letters"
+
+LOCATION_QUEUE = "queue"
+LOCATION_ARCHIVE = "archive"
+LOCATION_DEAD_LETTER = "dead-letters"
+
+# Surfaced on every record `list_tasks` and `get_task` return, as `queue_location`. A
+# caller must be able to tell a dead-lettered record from a live one without inspecting
+# file paths — which it cannot see anyway, since `_path` is stripped on the way out.
+QUEUE_LOCATION_KEY = "queue_location"
+
 # context_refs validation: enforce absolute paths (must start with '/').
 # Trust model: we do not restrict to a specific prefix allowlist — consumers
 # are responsible for validating that dereferenced paths are accessible and safe.
@@ -157,31 +196,56 @@ def _load_task_file(path: str) -> dict | None:
         return None
 
 
-def _load_all_tasks(queue_dir: str, include_archived: bool = False) -> list[dict]:
-    """
-    Load all *.yml task files from queue_dir, skipping .tmp files.
-    Attaches _path to each task dict for internal use (stripped before returning to callers).
-    """
-    tasks = []
-
-    for path in glob.glob(os.path.join(queue_dir, "*.yml")):
+def _load_dir(directory: str, location: str, into: list[dict]) -> None:
+    """Load every *.yml in one queue directory, tagging each record with its location."""
+    for path in glob.glob(os.path.join(directory, "*.yml")):
         if path.endswith(".tmp"):
             continue
         task = _load_task_file(path)
         if task is not None:
             task["_path"] = path
-            tasks.append(task)
+            task["_location"] = location
+            into.append(task)
 
+
+def _load_all_tasks(
+    queue_dir: str,
+    include_archived: bool = False,
+    include_dead_letters: bool = False,
+) -> list[dict]:
+    """
+    Load all *.yml task files from queue_dir, skipping .tmp files.
+
+    Attaches _path and _location to each task dict for internal use; both are stripped
+    before anything is returned to a caller or written back to disk.
+
+    Both opt-ins default off, and dead letters are deliberately the stricter of the two:
+    an archived record is finished work, but a dead letter is *unfinished* work that no
+    longer has a route, and it must never land in the `list_tasks` sweep an agent uses as
+    its work list. See list_tasks_handler.
+    """
+    tasks: list[dict] = []
+
+    _load_dir(queue_dir, LOCATION_QUEUE, tasks)
     if include_archived:
-        for path in glob.glob(os.path.join(queue_dir, "archive", "*.yml")):
-            if path.endswith(".tmp"):
-                continue
-            task = _load_task_file(path)
-            if task is not None:
-                task["_path"] = path
-                tasks.append(task)
+        _load_dir(os.path.join(queue_dir, ARCHIVE_DIRNAME), LOCATION_ARCHIVE, tasks)
+    if include_dead_letters:
+        _load_dir(os.path.join(queue_dir, DEAD_LETTER_DIRNAME), LOCATION_DEAD_LETTER, tasks)
 
     return tasks
+
+
+def _public_task(task: dict) -> dict:
+    """
+    The caller-facing view of a loaded record: internal keys out, `queue_location` in.
+
+    Every internal key is prefixed `_`, and this strips the whole class rather than
+    naming them one at a time — the previous `k != "_path"` spelling would have leaked
+    `_location` into every response the day it was added.
+    """
+    public = {k: v for k, v in task.items() if not k.startswith("_")}
+    public[QUEUE_LOCATION_KEY] = task.get("_location", LOCATION_QUEUE)
+    return public
 
 
 def _write_task_atomic(path: str, data: dict) -> None:
@@ -189,7 +253,12 @@ def _write_task_atomic(path: str, data: dict) -> None:
     tmp = path + ".tmp"
     # Remove internal metadata before serialization — always use yaml.dump,
     # never string interpolation, to correctly escape user-supplied strings.
-    write_data = {k: v for k, v in data.items() if k != "_path"}
+    #
+    # Strips every `_`-prefixed key, not just `_path`. The handlers pop `_path` and then
+    # hand the rest of the loaded dict straight here, so anything else the loader attaches
+    # would be persisted into the YAML on the next transition — a load-time annotation
+    # silently becoming a stored field.
+    write_data = {k: v for k, v in data.items() if not k.startswith("_")}
     with open(tmp, "w") as f:
         yaml.dump(write_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     os.rename(tmp, path)
@@ -219,6 +288,39 @@ def _task_lock(queue_dir: str, task_id: str):
             yield
         finally:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def _find_dead_letter(queue_dir: str, task_id: str) -> dict | None:
+    """The dead-lettered record for task_id, with _path/_location attached, or None."""
+    records: list[dict] = []
+    _load_dir(os.path.join(queue_dir, DEAD_LETTER_DIRNAME), LOCATION_DEAD_LETTER, records)
+    return next((t for t in records if t.get("id") == task_id), None)
+
+
+# The refusal a mutating handler gives for a dead-lettered task. It is a distinct message
+# from `not found` on purpose: the mutating handlers deliberately do not load
+# `dead-letters/` at all, which is what keeps a dead letter unreachable from update_task,
+# set_task_status, park/unpark and amend — but that made every one of them answer
+# `not found` for a record plainly on disk, which is the exact confusion this build exists
+# to remove. The refusal names the state and the one door out of it.
+DEAD_LETTER_REFUSAL = (
+    "task is dead-lettered and cannot be mutated in place — requeue it first "
+    "(operator only, POST /tasks/<id>/requeue)"
+)
+
+
+def _not_found(queue_dir: str, task_id: str) -> dict:
+    """`not found`, refined to the dead-letter refusal when the record is dead-lettered."""
+    if _find_dead_letter(queue_dir, task_id) is not None:
+        return {"ok": False, "error": DEAD_LETTER_REFUSAL}
+    return {"ok": False, "error": "not found"}
+
+
+def count_dead_letters(queue_dir: str) -> int:
+    """How many records sit in dead-letters/. Used by the /queue/summary route."""
+    records: list[dict] = []
+    _load_dir(os.path.join(queue_dir, DEAD_LETTER_DIRNAME), LOCATION_DEAD_LETTER, records)
+    return len(records)
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +513,7 @@ def list_tasks_handler(
     status: str | None = None,
     task_type: str | None = None,
     include_archived: bool = False,
+    include_dead_letters: bool = False,
     limit: int = 20,
     queue_dir: str | None = None,
 ) -> list:
@@ -439,7 +542,15 @@ def list_tasks_handler(
             )
         status_filter = set(requested)
 
-    tasks = _load_all_tasks(queue_dir, include_archived=include_archived)
+    # Dead letters are opt-in and OFF by default, mirroring include_archived. A dead
+    # letter is not actionable work: every agent's work sweep is a `list_tasks` call, and
+    # folding seventeen permanently-unroutable records into it would hand each agent a
+    # backlog it cannot act on. Visibility is the point, not re-delivery.
+    tasks = _load_all_tasks(
+        queue_dir,
+        include_archived=include_archived,
+        include_dead_letters=include_dead_letters,
+    )
 
     now = _now()
     filtered = []
@@ -460,10 +571,18 @@ def list_tasks_handler(
         # age out of the default view. But nothing that is still someone's responsibility
         # should be hidden by a clock — an agent handed a stale open task can judge it,
         # whereas nobody can act on a task they cannot see.
+        # DEAD LETTERS ARE EXEMPT TOO, for the same reason parked and open work are. A
+        # dead-lettered task carries the status the dispatcher last wrote — `failed`,
+        # which is terminal — so without this every one of the seventeen would age out of
+        # the very listing added to reveal them: the newest is past its ttl_days, and
+        # `include_dead_letters=True` would have returned an empty list. Ageing out is for
+        # finished work. A dead letter is unfinished work with no route, and a clock must
+        # not be what hides it.
         created = task.get("created")
         ttl_days = task.get("ttl_days", 30)
         if (
-            task.get("status") not in NON_TERMINAL_STATUSES
+            task.get("_location") != LOCATION_DEAD_LETTER
+            and task.get("status") not in NON_TERMINAL_STATUSES
             and created
             and isinstance(created, datetime)
             and now > created + timedelta(days=ttl_days)
@@ -481,15 +600,26 @@ def list_tasks_handler(
 
         filtered.append(task)
 
-    def _sort_key(t: dict) -> datetime:
+    # Created descending, but DEAD LETTERS FIRST when they were asked for.
+    #
+    # This is not a cosmetic preference. A dead letter is by construction among the oldest
+    # records in the queue — it got there by exhausting retries — so under a plain
+    # created-descending sort all seventeen land at the very bottom, behind several hundred
+    # live tasks, and `filtered[:limit]` discards every one of them. Verified against the
+    # live queue while building this: `include_dead_letters=True, limit=200` returned 200
+    # rows and zero dead letters. A flag whose whole purpose is to reveal them, returning
+    # none of them on the only queue that has any, is the same silence in a new shape.
+    #
+    # Nobody passes this flag except to audit the failure path, so the thing asked for is
+    # the thing shown first. The ordering within each group is unchanged.
+    def _sort_key(t: dict) -> tuple[int, datetime]:
         c = t.get("created")
-        if isinstance(c, datetime):
-            return c
-        return datetime.min.replace(tzinfo=UTC)
+        created = c if isinstance(c, datetime) else datetime.min.replace(tzinfo=UTC)
+        return (1 if t.get("_location") == LOCATION_DEAD_LETTER else 0, created)
 
     filtered.sort(key=_sort_key, reverse=True)
 
-    return [{k: v for k, v in t.items() if k != "_path"} for t in filtered[:limit]]
+    return [_public_task(t) for t in filtered[:limit]]
 
 
 def get_task_handler(task_id: str, queue_dir: str | None = None) -> dict:
@@ -501,11 +631,18 @@ def get_task_handler(task_id: str, queue_dir: str | None = None) -> dict:
     except ValueError:
         return {"ok": False, "error": "invalid task_id format"}
 
-    # Search main queue, then archive/
-    tasks = _load_all_tasks(queue_dir, include_archived=True)
+    # Search main queue, then archive/, then dead-letters/.
+    #
+    # Dead letters are included here with no opt-in, unlike in list_tasks: asking for a
+    # task by id is not a work sweep, it is someone holding a specific id and wanting to
+    # know what became of it. Answering `not found` for a record sitting on disk is the
+    # bug — a dropped audit request looked identical to an id that never existed. The
+    # returned record keeps its `failed_reason` block and carries `queue_location`, so a
+    # caller can tell a dead letter from live work without inspecting paths.
+    tasks = _load_all_tasks(queue_dir, include_archived=True, include_dead_letters=True)
     for task in tasks:
         if task.get("id") == task_id:
-            return {k: v for k, v in task.items() if k != "_path"}
+            return _public_task(task)
 
     return {"ok": False, "error": "not found"}
 
@@ -566,9 +703,9 @@ def update_task_handler(
         task = next((t for t in tasks if t.get("id") == task_id), None)
 
         if task is None:
-            return {"ok": False, "error": "not found"}
+            return _not_found(queue_dir, task_id)
 
-        if "archive" in task.get("_path", ""):
+        if task.get("_location") == LOCATION_ARCHIVE:
             return {"ok": False, "error": "task is archived and cannot be updated"}
 
         current_status = task.get("status")
@@ -705,7 +842,7 @@ def _auto_close_originating_task(
                 "auto-close skipped: originating task %s not found", originating_task_id[:8]
             )
             return None
-        if "archive" in parent.get("_path", ""):
+        if parent.get("_location") == LOCATION_ARCHIVE:
             return None
 
         parent_status = parent.get("status")
@@ -838,9 +975,9 @@ def set_task_status_handler(
         task = next((t for t in tasks if t.get("id") == task_id), None)
 
         if task is None:
-            return {"ok": False, "error": "not found"}
+            return _not_found(queue_dir, task_id)
 
-        if "archive" in task.get("_path", ""):
+        if task.get("_location") == LOCATION_ARCHIVE:
             return {"ok": False, "error": "task is archived and cannot be updated"}
 
         current_status = task.get("status")
@@ -1034,7 +1171,7 @@ def unpark_task_handler(
     tasks = _load_all_tasks(queue_dir, include_archived=True)
     task = next((t for t in tasks if t.get("id") == task_id), None)
     if task is None:
-        return {"ok": False, "error": "not found"}
+        return _not_found(queue_dir, task_id)
     if task.get("status") != "parked":
         return {"ok": False, "error": f"task is not parked (status: {task.get('status')!r})"}
 
@@ -1106,9 +1243,9 @@ def amend_task_handler(
         task = next((t for t in tasks if t.get("id") == task_id), None)
 
         if task is None:
-            return {"ok": False, "error": "not found"}
+            return _not_found(queue_dir, task_id)
 
-        if "archive" in task.get("_path", ""):
+        if task.get("_location") == LOCATION_ARCHIVE:
             return {"ok": False, "error": "task is archived and cannot be amended"}
 
         current_status = task.get("status")
@@ -1185,4 +1322,139 @@ def amend_task_handler(
         "task_id": task_id,
         "amendment_count": len(amendments),
         "agent_may_have_started": current_status == "in-progress",
+    }
+
+
+def requeue_dead_letter_handler(
+    task_id: str,
+    actor: str,
+    note: str = "",
+    queue_dir: str | None = None,
+) -> dict:
+    """
+    Move a dead-lettered task back into the active queue at `submitted`.
+
+    OPERATOR ONLY. This is the one path in the whole module that walks a record out of a
+    terminal status, and it exists because the alternative — a dropped task being
+    unrecoverable except by hand-editing YAML — is what let seventeen of them sit for
+    three months. Resurrecting work is an operator judgement in the same way cancelling it
+    is; an agent must not be able to bring back its own dropped request, or a routing bug
+    becomes an agent-driven retry loop with no ceiling. The gate is enforced one level up,
+    in server.py, by the same `require_operator_surface` that gates set_task_status.
+
+    The terminal-immutability rule is not weakened by this. It is scoped to the
+    dead-letter directory and nowhere else: the record is looked up ONLY under
+    `dead-letters/`, so a `failed` task in the queue root or in `archive/` is not
+    reachable here however its id is spelled. A dead letter's `failed` status is the
+    dispatcher's record of exhausting its retries, not an agent's judgement that the work
+    is over.
+
+    What changes: status → `submitted`, `failed_reason` dropped, `retry_policy` reset to
+    a fresh `{next_retry_at: None, retry_count: 0}` — the whole block, since leaving a
+    `last_failure_reason` and a long-past `next_retry_at` behind would describe a failure
+    that is no longer this task's state. `created` is NOT refreshed: when the work was
+    first asked for is the record, and rewriting it to make the age look better is exactly
+    the thing that made this backlog invisible. `alert_state` is left alone — the
+    dispatcher owns it.
+
+    NOTE the root cause is not fixed by this. Requeueing one of the seventeen tasks that
+    were dropped for `Invalid or missing build_name in payload: 'unknown'` sends it back
+    through the same routing that rejected it, and it will dead-letter again after three
+    retries. That bug is vikunja#63/#169. Amend the task's payload first, or expect it
+    back.
+
+    Returns {ok, task_id, filename, requeued_from} or {ok: false, error}.
+    """
+    if queue_dir is None:
+        queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
+
+    try:
+        uuid.UUID(task_id)
+    except ValueError:
+        return {"ok": False, "error": "invalid task_id format"}
+
+    if not actor or not actor.strip():
+        return {"ok": False, "error": "actor must not be empty"}
+
+    with _task_lock(queue_dir, task_id):
+        task = _find_dead_letter(queue_dir, task_id)
+        if task is None:
+            return {"ok": False, "error": "not found"}
+
+        src = task.pop("_path")
+        dest = os.path.join(queue_dir, os.path.basename(src))
+
+        # A live file under the same name means some other record already occupies this
+        # slot in the queue root. Overwriting it would destroy live work to recover dead
+        # work, so refuse and let an operator look.
+        #
+        # SECURITY[accepted]: this is a check-then-act, not an atomic guard. `_task_lock`
+        # is keyed on the DEAD-LETTERED TASK'S id, not on `dest`, so it serialises against
+        # another requeue of this same task and nothing else. Between this `os.path.exists`
+        # and the `os.rename` inside `_write_task_atomic` — which overwrites unconditionally
+        # on POSIX — another writer (most plausibly `submit_task`) could create `dest`, and
+        # the rename would clobber it silently.
+        #
+        # Accepted because the window is bounded by filename entropy: names are
+        # `<YYYYMMDD-HHMMSS>-<id8>.yml`, so a real collision needs the same second AND the
+        # same 8 hex characters of a different UUID, which in practice means the same task.
+        # It is also not attacker-reachable — requeue is operator-only and `dead-letters/`
+        # is not agent-writable — so the exposure is data integrity, not privilege.
+        #
+        # NOTE FOR WHOEVER TOUCHES THIS NEXT: wrapping the existence check in a try/except,
+        # or hardening it in place, does NOT close the gap. Only a lock keyed on `dest`, or
+        # an `O_EXCL` create of `dest` before the write, would. Do not read the presence of
+        # this check as evidence the race is handled.
+        # (audit 2026-08-29/agent-workflow-interop-2026-08-phase1, F-01 LOW, confirmed
+        # no-action; originally self-flagged in the audit request's Known Risks #3.)
+        if os.path.exists(dest):
+            return {
+                "ok": False,
+                "error": (
+                    f"cannot requeue: {os.path.basename(dest)} already exists in the "
+                    f"queue root. Resolve the collision by hand."
+                ),
+            }
+
+        now = _now()
+        previous_status = task.get("status")
+        failed_reason = task.pop("failed_reason", None)
+        task["status"] = "submitted"
+        task["retry_policy"] = {"next_retry_at": None, "retry_count": 0}
+
+        history_entry = {
+            "timestamp": now,
+            "status": "submitted",
+            "actor": actor,
+            "note": note or "Requeued from dead-letters",
+            "action": "requeue",
+            "requeued_from": LOCATION_DEAD_LETTER,
+        }
+        if isinstance(failed_reason, dict) and failed_reason.get("reason"):
+            # The reason it was dropped survives its own field being cleared. Without
+            # this, a requeued task carries no trace of why it was ever dead, and the
+            # second drop reads as the first.
+            history_entry["cleared_failed_reason"] = failed_reason["reason"]
+        if task.get("history") is None:
+            task["history"] = []
+        task["history"].append(history_entry)
+
+        # Write the destination first, then unlink the source: a crash between the two
+        # leaves the task visible in both places, which an operator can see and fix. The
+        # reverse order can lose it entirely. Same order the dispatcher uses on the way in.
+        _write_task_atomic(dest, task)
+        os.remove(src)
+
+    logger.info(
+        "task.requeue id=%s %s→submitted actor=%s from=%s",
+        task_id[:8],
+        previous_status,
+        actor,
+        LOCATION_DEAD_LETTER,
+    )
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "filename": os.path.basename(dest),
+        "requeued_from": LOCATION_DEAD_LETTER,
     }

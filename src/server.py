@@ -24,9 +24,11 @@ from src.tools.queue import (
     _load_all_tasks,
     amend_task_handler,
     cancel_task_handler,
+    count_dead_letters,
     get_task_handler,
     list_tasks_handler,
     park_task_handler,
+    requeue_dead_letter_handler,
     set_task_status_handler,
     submit_task_handler,
     unpark_task_handler,
@@ -141,6 +143,7 @@ def list_tasks(
     status: str | None = None,
     task_type: str | None = None,
     include_archived: bool = False,
+    include_dead_letters: bool = False,
     limit: int = 20,
 ) -> list:
     """
@@ -149,6 +152,12 @@ def list_tasks(
       status — an unrecognised one is an error, not an empty result.
       Valid: submitted, approved, pending-approval, in-progress, parked, routing-failed,
       completed, failed, cancelled.
+    include_dead_letters: also return records the dispatcher gave up routing and moved to
+      dead-letters/. OFF by default — a dead letter is not actionable work and must not
+      appear in a work sweep. Turn it on to audit the failure path. Dead letters are
+      exempt from the TTL filter, so old ones still appear.
+    Every record carries `queue_location` — "queue", "archive" or "dead-letters" — so a
+      dead letter is distinguishable from live work without inspecting file paths.
     Returns tasks sorted by created descending. Expired tasks (past ttl_days) are excluded
     only if they are terminal — open work stays listed however old it is, so nothing that
     is still someone's responsibility can quietly age out of view.
@@ -159,6 +168,7 @@ def list_tasks(
         status=status,
         task_type=task_type,
         include_archived=include_archived,
+        include_dead_letters=include_dead_letters,
         limit=limit,
         queue_dir=QUEUE_DIR,
     )
@@ -167,7 +177,10 @@ def list_tasks(
 @mcp.tool()
 def get_task(task_id: str) -> dict:
     """
-    Get a task by UUID. Searches main queue then archive/.
+    Get a task by UUID. Searches main queue, then archive/, then dead-letters/.
+    A dead-lettered record comes back with its `failed_reason` block intact and
+    `queue_location: "dead-letters"` — it is a record of a dropped task, not live work,
+    and cannot be transitioned until an operator requeues it.
     Returns full task dict or {ok: false, error}.
     """
     return get_task_handler(task_id=task_id, queue_dir=QUEUE_DIR)
@@ -251,6 +264,29 @@ def cancel_task(task_id: str, actor: str, note: str = "") -> dict:
         return {"ok": False, "error": refusal}
 
     return cancel_task_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
+
+
+@mcp.tool()
+def requeue_dead_letter(task_id: str, actor: str, note: str = "") -> dict:
+    """
+    Return a dead-lettered task to the active queue at `submitted`, clearing its
+    failed_reason and resetting its retry count. The requeue is recorded in history.
+
+    OPERATOR ONLY — not reachable with an agent identity, the same gate as
+    set_task_status. Resurrecting a dropped task is an operator judgement: if an agent
+    could requeue its own dead letters, a routing bug that drops a task becomes an
+    agent-driven retry loop with nothing bounding it. The retry ceiling the dispatcher
+    enforces would be a ceiling on nothing.
+
+    Only records under dead-letters/ are reachable here — a `failed` task in the live
+    queue or in archive/ is not, whatever id is passed. Requeueing does not fix why the
+    task was dropped; if the cause is still live it will dead-letter again.
+    """
+    refusal = require_operator_surface("requeue_dead_letter")
+    if refusal:
+        return {"ok": False, "error": refusal}
+
+    return requeue_dead_letter_handler(task_id=task_id, actor=actor, note=note, queue_dir=QUEUE_DIR)
 
 
 @mcp.tool()
@@ -521,12 +557,38 @@ async def http_update(request: Request) -> JSONResponse:
     return _control_response(result)
 
 
+@mcp.custom_route("/tasks/{task_id}/requeue", methods=["POST"])
+async def http_requeue(request: Request) -> JSONResponse:
+    """
+    The operator's path to recovering a dead-lettered task. Gated by the shared secret
+    like every other route here, which is what makes it operator-only in practice: the
+    MCP tool of the same name refuses any resolved agent identity, and these custom routes
+    sit outside the transport auth where OPERATOR_ACTOR is assertable and nowhere else.
+    """
+    if not _authorized(request):
+        return _unauthorized()
+    body = await _json_body(request)
+    result = requeue_dead_letter_handler(
+        task_id=request.path_params["task_id"],
+        actor=OPERATOR_ACTOR,
+        note=body.get("note", ""),
+        queue_dir=QUEUE_DIR,
+    )
+    return _control_response(result)
+
+
 @mcp.custom_route("/queue/summary", methods=["GET"])
 async def http_queue_summary(request: Request) -> JSONResponse:
     """
     Counts by status across the active queue. Statuses outside VALID_STATUSES are bucketed
     under "unknown" rather than dropped, so records written by other direct-YAML writers
     (the dispatcher's `routing-failed`, or historic typos) stay visible.
+
+    `dead_letters` is a sibling of `counts`, not a member of it. Every dead letter carries
+    the status `failed`, so folding them into the status histogram would bury them among
+    genuinely finished work — which is how seventeen of them went uncounted by every
+    interface for three months. `counts`, `active` and `total` all describe the ACTIVE
+    queue only; `dead_letters` is the number of records the dispatcher gave up on.
     """
     if not _authorized(request):
         return _unauthorized()
@@ -544,7 +606,13 @@ async def http_queue_summary(request: Request) -> JSONResponse:
 
     active = sum(n for s, n in counts.items() if s in NON_TERMINAL_STATUSES)
     return JSONResponse(
-        {"ok": True, "counts": counts, "active": active, "total": sum(counts.values())}
+        {
+            "ok": True,
+            "counts": counts,
+            "active": active,
+            "total": sum(counts.values()),
+            "dead_letters": count_dead_letters(QUEUE_DIR),
+        }
     )
 
 
