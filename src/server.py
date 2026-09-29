@@ -1,23 +1,33 @@
-import hmac
 import json
 import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from datetime import date, datetime
 
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import Response
 
 from src.auth import (
+    LEGACY_CHANNEL,
+    LEGACY_SECRET_ENV,
+    LEGACY_SECRET_HEADER,
+    SCOPE_OPERATOR_WRITE,
+    SCOPE_READ,
     TOKEN_ENV_PREFIX,
     AuthConfigError,
+    Client,
+    authorize_client,
     bind_actor,
     build_verifier,
+    legacy_secret_configured,
     load_agent_tokens,
+    load_client_tokens,
     require_operator_surface,
 )
 from src.tools.queue import (
+    LIST_PAGE_MAX,
     NON_TERMINAL_STATUSES,
     OPERATOR_ACTOR,
     VALID_STATUSES,
@@ -27,6 +37,7 @@ from src.tools.queue import (
     count_dead_letters,
     get_task_handler,
     list_tasks_handler,
+    list_tasks_page_handler,
     park_task_handler,
     requeue_dead_letter_handler,
     set_task_status_handler,
@@ -359,52 +370,113 @@ def amend_task(task_id: str, amendment: str, actor: str, reason: str = "") -> di
 
 
 # ---------------------------------------------------------------------------
-# HTTP control API — the single validated mutation path for non-MCP clients
-# (the CloudCLI plugin and the Matrix bot). Mounted as custom routes on the
-# existing FastMCP HTTP app, so it shares this container and port 8485.
+# HTTP control and read API — the operator surface for non-MCP clients (the CloudCLI
+# plugin, the Matrix bot, and from operator-panel part 4 the panel). Mounted as custom
+# routes on the existing FastMCP HTTP app, so it shares this container and port 8485.
 #
-# These routes are NOT behind the MCP bearer auth added in v0.7.0 — custom_route
-# handlers bypass the transport's auth provider — so TASK_QUEUE_API_SECRET remains
-# their only gate. Until v0.7.0 that sentence read as though an MCP auth middleware
-# already existed; it did not, and the tool path was open (vikunja#387). It does now,
-# and these routes are deliberately outside it: they are the operator surface, and the
-# operator identity is reachable from here and nowhere else.
+# Each client authenticates with its own token in X-Task-Queue-Token and holds explicit
+# scopes: `read` for the GET routes, `operator-write` for the POST routes. Neither implies
+# the other. See the client-token section of src/auth.py for why the server stores only
+# digests and why the header is not Authorization.
 #
-# Note this gate contains mistakes rather than intent: wherever an agent holds a shell
-# tool and runs as the OS user that owns the secret file, it can read the secret. Closing
-# that needs per-agent OS users or a credential broker, not a change here.
+# FastMCP's AuthenticationMiddleware runs on these routes too, not only on /mcp, so a valid
+# agent bearer DOES authenticate the request at the Starlette layer. Only /mcp enforces it.
+# These routes ignore that result: authorize_client reads the client header and nothing
+# else, so an agent identity grants nothing here. (Until v0.11.0 this comment said
+# custom routes "bypass the transport's auth provider". True for enforcement only.)
 #
 # Every route delegates to the same handlers as the MCP tools, inheriting transition
-# validation + fcntl locking + atomic writes. Reads stay direct in the clients.
+# validation, fcntl locking and atomic writes. Reads used to stay direct in the clients,
+# which made each client another reader of the queue YAML with its own copy of the TTL,
+# dead-letter and status rules. v0.11.0 reverses that: the read routes wrap the handlers
+# that already carry those rules.
+#
+# This contains mistakes rather than intent: the cloudcli and matrix-bot tokens sit in
+# files `ted` can read, and every agent runs as `ted`. What changed is that no credential
+# for this API is in any process's environment. Only a client whose plaintext lives under
+# another UID (the panel, part 4) gets a real boundary out of this.
 # ---------------------------------------------------------------------------
-
-SECRET_HEADER = "X-Task-Queue-Secret"
 
 # These routes ARE the operator surface, so the actor is pinned rather than defaulted.
 # It was previously `body.get("actor", "operator")` on all six mutation routes: correct in
 # practice, but it made the operator identity something a caller inherited by omission
 # rather than something anyone chose. Pinning it means a future non-operator client on
 # these routes cannot quietly acquire the identity that every ownership check exempts —
-# it would have to be given its own path, deliberately.
-#
-# This is narrower than it may look. The shared secret is what gates these routes, and any
-# caller that holds it can already assert this identity; pinning removes an accident, not
-# an attack. See the note on the control-API block above.
+# it would have to be given its own path, deliberately. Which client it was is recorded
+# separately, as `channel` on the history entry.
 #
 # OPERATOR_ACTOR is imported from src.tools.queue — it was defined here as a second copy of
 # the same literal until the 2026-08-16 audit caught it (LOW).
 
+# Client tokens, digest -> Client. Loaded at import like the agent tokens, and fatal on a
+# bad configuration for the same reason: every way it can be wrong fails open or
+# mis-attributes. Zero clients is allowed and refuses every custom-route request.
+try:
+    _client_tokens = load_client_tokens(agent_tokens=_agent_tokens)
+except AuthConfigError as exc:
+    logger.error("Refusing to start: %s", exc)
+    sys.exit(1)
 
-def _authorized(request: Request) -> bool:
-    """Constant-time shared-secret check. Fails closed when no secret is configured."""
-    secret = os.environ.get("TASK_QUEUE_API_SECRET", "")
-    if not secret:
-        logger.warning("TASK_QUEUE_API_SECRET not configured — rejecting control-API request")
-        return False
-    provided = request.headers.get(SECRET_HEADER, "")
-    # Compare as bytes — hmac.compare_digest raises TypeError on str operands with
-    # non-ASCII chars, so a malformed header must not escape as a 500. (audit L-02)
-    return hmac.compare_digest(provided.encode("utf-8"), secret.encode("utf-8"))
+# (method, path) -> required scope, filled in by _control_route. Tests enumerate the app's
+# routes against this so a route added without a scope is caught.
+ROUTE_SCOPES: dict[tuple[str, str], str] = {}
+
+
+def _json_default(value):
+    # yaml.safe_load produces datetimes and dates for timestamp fields. The MCP transport
+    # serialises them as ISO 8601 through pydantic, and the HTTP routes must match it.
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    return str(value)
+
+
+def _json(payload: dict, status_code: int = 200) -> Response:
+    return Response(
+        json.dumps(payload, default=_json_default),
+        status_code=status_code,
+        media_type="application/json",
+    )
+
+
+def _unauthorized() -> Response:
+    return _json({"ok": False, "error": "unauthorized"}, status_code=401)
+
+
+def _control_route(path: str, method: str, scope: str):
+    """
+    Register a custom route behind the client-token gate with one required scope.
+
+    The wrapped handler receives the authenticated Client. A request with no valid token is
+    401. A valid token without the route's scope is 403, which tells a client its
+    credential works but was never granted this.
+    """
+
+    def register(handler):
+        async def endpoint(request: Request) -> Response:
+            client = authorize_client(request.headers, _client_tokens)
+            if client is None:
+                logger.warning("control-api: %s %s refused: no valid client token", method, path)
+                return _unauthorized()
+            if scope not in client.scopes:
+                logger.warning(
+                    "control-api: %s %s refused: channel %s lacks scope %s",
+                    method,
+                    path,
+                    client.channel,
+                    scope,
+                )
+                return _json({"ok": False, "error": f"scope {scope} required"}, status_code=403)
+            log = logger.info if scope == SCOPE_OPERATOR_WRITE else logger.debug
+            log("control-api: %s %s channel=%s", method, request.url.path, client.channel)
+            return await handler(request, client)
+
+        endpoint.__name__ = handler.__name__
+        endpoint.__doc__ = handler.__doc__
+        ROUTE_SCOPES[(method, path)] = scope
+        mcp.custom_route(path, methods=[method])(endpoint)
+        return endpoint
+
+    return register
 
 
 async def _json_body(request: Request) -> dict:
@@ -427,18 +499,15 @@ def _status_for(result: dict) -> int:
     return 400
 
 
-def _control_response(result: dict) -> JSONResponse:
-    return JSONResponse(result, status_code=_status_for(result))
+def _control_response(result: dict) -> Response:
+    return _json(result, status_code=_status_for(result))
 
 
-def _unauthorized() -> JSONResponse:
-    return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+# ── operator writes (scope: operator-write) ─────────────────────────────
 
 
-@mcp.custom_route("/tasks/{task_id}/approve", methods=["POST"])
-async def http_approve(request: Request) -> JSONResponse:
-    if not _authorized(request):
-        return _unauthorized()
+@_control_route("/tasks/{task_id}/approve", "POST", SCOPE_OPERATOR_WRITE)
+async def http_approve(request: Request, client: Client) -> Response:
     body = await _json_body(request)
     result = set_task_status_handler(
         task_id=request.path_params["task_id"],
@@ -446,28 +515,26 @@ async def http_approve(request: Request) -> JSONResponse:
         actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
         queue_dir=QUEUE_DIR,
+        channel=client.channel,
     )
     return _control_response(result)
 
 
-@mcp.custom_route("/tasks/{task_id}/cancel", methods=["POST"])
-async def http_cancel(request: Request) -> JSONResponse:
-    if not _authorized(request):
-        return _unauthorized()
+@_control_route("/tasks/{task_id}/cancel", "POST", SCOPE_OPERATOR_WRITE)
+async def http_cancel(request: Request, client: Client) -> Response:
     body = await _json_body(request)
     result = cancel_task_handler(
         task_id=request.path_params["task_id"],
         actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
         queue_dir=QUEUE_DIR,
+        channel=client.channel,
     )
     return _control_response(result)
 
 
-@mcp.custom_route("/tasks/{task_id}/status", methods=["POST"])
-async def http_set_status(request: Request) -> JSONResponse:
-    if not _authorized(request):
-        return _unauthorized()
+@_control_route("/tasks/{task_id}/status", "POST", SCOPE_OPERATOR_WRITE)
+async def http_set_status(request: Request, client: Client) -> Response:
     body = await _json_body(request)
     result = set_task_status_handler(
         task_id=request.path_params["task_id"],
@@ -476,28 +543,26 @@ async def http_set_status(request: Request) -> JSONResponse:
         note=body.get("note", ""),
         allow_override=bool(body.get("allow_override", False)),
         queue_dir=QUEUE_DIR,
+        channel=client.channel,
     )
     return _control_response(result)
 
 
-@mcp.custom_route("/tasks/{task_id}/park", methods=["POST"])
-async def http_park(request: Request) -> JSONResponse:
-    if not _authorized(request):
-        return _unauthorized()
+@_control_route("/tasks/{task_id}/park", "POST", SCOPE_OPERATOR_WRITE)
+async def http_park(request: Request, client: Client) -> Response:
     body = await _json_body(request)
     result = park_task_handler(
         task_id=request.path_params["task_id"],
         actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
         queue_dir=QUEUE_DIR,
+        channel=client.channel,
     )
     return _control_response(result)
 
 
-@mcp.custom_route("/tasks/{task_id}/unpark", methods=["POST"])
-async def http_unpark(request: Request) -> JSONResponse:
-    if not _authorized(request):
-        return _unauthorized()
+@_control_route("/tasks/{task_id}/unpark", "POST", SCOPE_OPERATOR_WRITE)
+async def http_unpark(request: Request, client: Client) -> Response:
     body = await _json_body(request)
     result = unpark_task_handler(
         task_id=request.path_params["task_id"],
@@ -505,14 +570,13 @@ async def http_unpark(request: Request) -> JSONResponse:
         note=body.get("note", ""),
         status=body.get("status"),
         queue_dir=QUEUE_DIR,
+        channel=client.channel,
     )
     return _control_response(result)
 
 
-@mcp.custom_route("/tasks/{task_id}/amend", methods=["POST"])
-async def http_amend(request: Request) -> JSONResponse:
-    if not _authorized(request):
-        return _unauthorized()
+@_control_route("/tasks/{task_id}/amend", "POST", SCOPE_OPERATOR_WRITE)
+async def http_amend(request: Request, client: Client) -> Response:
     body = await _json_body(request)
     result = amend_task_handler(
         task_id=request.path_params["task_id"],
@@ -520,12 +584,13 @@ async def http_amend(request: Request) -> JSONResponse:
         actor=OPERATOR_ACTOR,
         reason=body.get("reason", ""),
         queue_dir=QUEUE_DIR,
+        channel=client.channel,
     )
     return _control_response(result)
 
 
-@mcp.custom_route("/tasks/{task_id}/update", methods=["POST"])
-async def http_update(request: Request) -> JSONResponse:
+@_control_route("/tasks/{task_id}/update", "POST", SCOPE_OPERATOR_WRITE)
+async def http_update(request: Request, client: Client) -> Response:
     """
     The operator's path to a terminal transition, including on another agent's behalf.
 
@@ -539,11 +604,9 @@ async def http_update(request: Request) -> JSONResponse:
     Leaving it there would mean every future stray needs the operator to intervene by hand,
     so the capability is kept and made explicit instead. Pass `on_behalf_of` naming the
     agent whose task it is; the handler verifies that against the task's target_agent and
-    records both names in history. A sweep should read as a sweep years later, not as the
-    agent having quietly closed its own work.
+    records both names in history, alongside the channel. A sweep should read as a sweep
+    years later, not as the agent having quietly closed its own work.
     """
-    if not _authorized(request):
-        return _unauthorized()
     body = await _json_body(request)
     result = update_task_handler(
         task_id=request.path_params["task_id"],
@@ -553,32 +616,129 @@ async def http_update(request: Request) -> JSONResponse:
         output=body.get("output"),
         on_behalf_of=body.get("on_behalf_of"),
         queue_dir=QUEUE_DIR,
+        channel=client.channel,
     )
     return _control_response(result)
 
 
-@mcp.custom_route("/tasks/{task_id}/requeue", methods=["POST"])
-async def http_requeue(request: Request) -> JSONResponse:
+@_control_route("/tasks/{task_id}/requeue", "POST", SCOPE_OPERATOR_WRITE)
+async def http_requeue(request: Request, client: Client) -> Response:
     """
-    The operator's path to recovering a dead-lettered task. Gated by the shared secret
-    like every other route here, which is what makes it operator-only in practice: the
-    MCP tool of the same name refuses any resolved agent identity, and these custom routes
-    sit outside the transport auth where OPERATOR_ACTOR is assertable and nowhere else.
+    The operator's path to recovering a dead-lettered task. The operator-write scope is
+    what makes it operator-only in practice: the MCP tool of the same name refuses any
+    resolved agent identity, and these custom routes are where OPERATOR_ACTOR is
+    assertable and nowhere else.
     """
-    if not _authorized(request):
-        return _unauthorized()
     body = await _json_body(request)
     result = requeue_dead_letter_handler(
         task_id=request.path_params["task_id"],
         actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
         queue_dir=QUEUE_DIR,
+        channel=client.channel,
     )
     return _control_response(result)
 
 
-@mcp.custom_route("/queue/summary", methods=["GET"])
-async def http_queue_summary(request: Request) -> JSONResponse:
+# ── reads (scope: read) ─────────────────────────────────────────────────
+
+# Every query parameter GET /tasks understands. Anything else is a 400: a misspelt filter
+# that was silently ignored would return the unfiltered queue, which reads as an answer.
+LIST_QUERY_PARAMS = frozenset(
+    {
+        "target_agent",
+        "source_agent",
+        "status",
+        "task_type",
+        "include_archived",
+        "include_dead_letters",
+        "limit",
+    }
+)
+LIST_DEFAULT_LIMIT = 200
+_TRUE_VALUES = frozenset({"true", "1", "yes"})
+_FALSE_VALUES = frozenset({"false", "0", "no"})
+
+
+def _query_bool(params, name: str) -> bool:
+    raw = params.get(name)
+    if raw is None:
+        return False
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise ValueError(f"{name} must be true or false, got {raw!r}")
+
+
+def _query_limit(params) -> int:
+    raw = params.get("limit")
+    if raw is None:
+        return LIST_DEFAULT_LIMIT
+    try:
+        limit = int(raw)
+    except ValueError:
+        raise ValueError(f"limit must be an integer, got {raw!r}") from None
+    # Out of range is refused, not clamped. A client asking for 5000 and silently getting
+    # 1000 would still be told by `truncated`, but it would never learn the cap exists.
+    if not 1 <= limit <= LIST_PAGE_MAX:
+        raise ValueError(f"limit must be between 1 and {LIST_PAGE_MAX}, got {limit}")
+    return limit
+
+
+@_control_route("/tasks", "GET", SCOPE_READ)
+async def http_list_tasks(request: Request, client: Client) -> Response:
+    """
+    list_tasks over HTTP. Returns {ok, tasks, count, truncated}.
+
+    `count` is how many records matched, and `truncated` is true when that is more than
+    were returned. Filters, TTL exemptions, dead-letter handling and ordering are
+    list_tasks_handler's, unchanged; only the ceiling differs (LIST_PAGE_MAX, not 200).
+    """
+    params = request.query_params
+    unknown = sorted(set(params.keys()) - LIST_QUERY_PARAMS)
+    if unknown:
+        return _json(
+            {
+                "ok": False,
+                "error": f"unknown query parameter(s) {unknown}. "
+                f"Valid: {sorted(LIST_QUERY_PARAMS)}",
+            },
+            status_code=400,
+        )
+    try:
+        page = list_tasks_page_handler(
+            target_agent=params.get("target_agent") or None,
+            source_agent=params.get("source_agent") or None,
+            status=params.get("status") or None,
+            task_type=params.get("task_type") or None,
+            include_archived=_query_bool(params, "include_archived"),
+            include_dead_letters=_query_bool(params, "include_dead_letters"),
+            limit=_query_limit(params),
+            queue_dir=QUEUE_DIR,
+        )
+    except ValueError as exc:
+        # An invalid status raises from the handler, as it does for the MCP tool. Over HTTP
+        # that is the caller's mistake, a 400, not a 500.
+        return _json({"ok": False, "error": str(exc)}, status_code=400)
+    return _json({"ok": True, **page})
+
+
+@_control_route("/tasks/{task_id}", "GET", SCOPE_READ)
+async def http_get_task(request: Request, client: Client) -> Response:
+    """
+    get_task over HTTP: searches the queue, archive/ and dead-letters/. Returns
+    {ok, task}; 400 on a malformed id, 404 when no record has it.
+    """
+    result = get_task_handler(task_id=request.path_params["task_id"], queue_dir=QUEUE_DIR)
+    if result.get("ok") is False:
+        return _control_response(result)
+    return _json({"ok": True, "task": result})
+
+
+@_control_route("/queue/summary", "GET", SCOPE_READ)
+async def http_queue_summary(request: Request, client: Client) -> Response:
     """
     Counts by status across the active queue. Statuses outside VALID_STATUSES are bucketed
     under "unknown" rather than dropped, so records written by other direct-YAML writers
@@ -590,9 +750,6 @@ async def http_queue_summary(request: Request) -> JSONResponse:
     interface for three months. `counts`, `active` and `total` all describe the ACTIVE
     queue only; `dead_letters` is the number of records the dispatcher gave up on.
     """
-    if not _authorized(request):
-        return _unauthorized()
-
     counts: dict[str, int] = {}
     unknown = 0
     for task in _load_all_tasks(QUEUE_DIR):
@@ -605,7 +762,7 @@ async def http_queue_summary(request: Request) -> JSONResponse:
         counts["unknown"] = unknown
 
     active = sum(n for s, n in counts.items() if s in NON_TERMINAL_STATUSES)
-    return JSONResponse(
+    return _json(
         {
             "ok": True,
             "counts": counts,
@@ -638,4 +795,23 @@ if __name__ == "__main__":
         len(_agent_tokens),
         ", ".join(sorted(_agent_tokens.values())),
     )
+    # Channel names and scopes only. Never a digest: it is not a secret, but it is the
+    # thing a leaked token is matched against, and a log has no reason to carry it.
+    logger.info(
+        "control API: %d client(s): %s",
+        len(_client_tokens),
+        ", ".join(
+            f"{c.channel}[{','.join(sorted(c.scopes))}]"
+            for c in sorted(_client_tokens.values(), key=lambda c: c.channel)
+        )
+        or "none — every control and read route will refuse",
+    )
+    if legacy_secret_configured():
+        logger.warning(
+            "control API: %s is set. %s is still accepted as channel %s with read and "
+            "operator-write. This is deprecated and removed in v0.12.0.",
+            LEGACY_SECRET_ENV,
+            LEGACY_SECRET_HEADER,
+            LEGACY_CHANNEL,
+        )
     mcp.run(transport="streamable-http", host=host, port=port)

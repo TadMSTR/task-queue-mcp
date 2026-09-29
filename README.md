@@ -248,25 +248,54 @@ pair therefore needs the *receiving* agent to claim and close its own entry — 
 `completed` is only reachable from `in-progress`. The [auto-close](#auto-close-of-the-originating-task-since-v060)
 is the fail-safe for when it doesn't, not a substitute for it.
 
-## HTTP Control API
+## HTTP Control and Read API
 
-Non-MCP clients (the CloudCLI plugin and Matrix bot) can't import the Python core, so all their mutations go through a thin HTTP control API mounted as FastMCP custom routes on the **same port 8485**. Each endpoint delegates to the tool handlers above, inheriting transition validation, `fcntl` locking, and atomic writes — so there is exactly one validated write path for the whole system.
+Non-MCP clients (the CloudCLI plugin, the Matrix bot, and an operator panel) can't import the Python core, so they read and write the queue through a thin HTTP API mounted as FastMCP custom routes on the **same port 8485**. Each endpoint delegates to the tool handlers above, inheriting transition validation, `fcntl` locking, atomic writes, and the TTL and dead-letter rules. There is one validated write path and, since v0.11.0, one read path, instead of every client parsing the queue YAML itself.
 
-| Method | Path | Delegates to |
-|--------|------|--------------|
-| `POST` | `/tasks/{id}/approve` | `set_task_status(approved)` |
-| `POST` | `/tasks/{id}/cancel` | `cancel_task` |
-| `POST` | `/tasks/{id}/status` | `set_task_status` (body: `status`, `note`, `allow_override`) |
-| `POST` | `/tasks/{id}/park` | `park_task` |
-| `POST` | `/tasks/{id}/unpark` | `unpark_task` (body: optional `status`) |
-| `POST` | `/tasks/{id}/amend` | `amend_task` (body: `amendment`, optional `reason`) |
-| `POST` | `/tasks/{id}/update` | `update_task` (body: `status`, `note`, `output`, optional `on_behalf_of`) |
-| `POST` | `/tasks/{id}/requeue` | `requeue_dead_letter` (body: optional `note`) |
-| `GET` | `/queue/summary` | Counts by status across the active queue, plus `dead_letters` |
+| Method | Path | Scope | Delegates to |
+|--------|------|-------|--------------|
+| `GET` | `/tasks` | `read` | `list_tasks`, with `count` and `truncated` (see below) |
+| `GET` | `/tasks/{id}` | `read` | `get_task`: queue, `archive/`, then `dead-letters/` |
+| `GET` | `/queue/summary` | `read` | Counts by status across the active queue, plus `dead_letters` |
+| `POST` | `/tasks/{id}/approve` | `operator-write` | `set_task_status(approved)` |
+| `POST` | `/tasks/{id}/cancel` | `operator-write` | `cancel_task` |
+| `POST` | `/tasks/{id}/status` | `operator-write` | `set_task_status` (body: `status`, `note`, `allow_override`) |
+| `POST` | `/tasks/{id}/park` | `operator-write` | `park_task` |
+| `POST` | `/tasks/{id}/unpark` | `operator-write` | `unpark_task` (body: optional `status`) |
+| `POST` | `/tasks/{id}/amend` | `operator-write` | `amend_task` (body: `amendment`, optional `reason`) |
+| `POST` | `/tasks/{id}/update` | `operator-write` | `update_task` (body: `status`, `note`, `output`, optional `on_behalf_of`) |
+| `POST` | `/tasks/{id}/requeue` | `operator-write` | `requeue_dead_letter` (body: optional `note`) |
 
-Body fields: `note`, plus `status` / `allow_override` for the status route, `amendment` / `reason` for amend, `status` / `output` / `on_behalf_of` for update. Responses map the canonical result: `200` ok, `404` not found, `400` validation/transition error.
+Body fields: `note`, plus `status` / `allow_override` for the status route, `amendment` / `reason` for amend, `status` / `output` / `on_behalf_of` for update. Responses map the canonical result: `200` ok, `404` not found, `400` validation/transition error. Auth failures are `401` (no valid token) and `403` (valid token without the route's scope).
 
 **`actor` is pinned to `operator` on every one of these routes and is not read from the body** (since v0.8.0). It was previously `body.get("actor", "operator")` — correct in practice, but it made the operator identity something a caller inherited by omission rather than something anyone chose. Pinning means a future non-operator client here cannot quietly acquire the identity that every ownership check exempts.
+
+**Every write records its `channel`** (since v0.11.0): which client made it. `actor` says the operator acted; `channel` says through what.
+
+```yaml
+history:
+  - timestamp: ...
+    status: approved
+    actor: operator
+    channel: matrix-bot
+    note: ""
+```
+
+MCP tool calls write no `channel`, and records written before v0.11.0 are not rewritten.
+
+### Reading the queue — `GET /tasks`, `GET /tasks/{id}`
+
+`GET /tasks` takes `target_agent`, `source_agent`, `status` (single or comma-separated), `task_type`, `include_archived`, `include_dead_letters` (`true`/`false`) and `limit` (default 200, max 1000). It returns:
+
+```json
+{"ok": true, "tasks": [...], "count": 612, "truncated": true}
+```
+
+`count` is how many records **matched**, not how many came back, and `truncated` is true whenever that is more than `len(tasks)`. The MCP tool returns a bare list and cannot say it cut anything off. That silence is how one dead-letter listing returned 200 rows and none of the records it was asked for. A client rendering this list should show `truncated`, not hide it.
+
+An unknown status, an unknown query parameter (a misspelt filter would otherwise return the unfiltered queue), a non-boolean flag, or a `limit` outside 1–1000 is a `400`. A limit above the ceiling is refused rather than clamped, so a client learns the cap exists.
+
+`GET /tasks/{id}` returns `{"ok": true, "task": {...}}`, `400` on a malformed id, `404` when no record has it. Timestamps are ISO 8601 strings, as on the MCP transport.
 
 ### The operator sweep — `POST /tasks/{id}/update`
 
@@ -299,11 +328,34 @@ Moves the record back to the queue root at `submitted`, drops `failed_reason`, a
 
 Requeueing does not fix *why* a task was dropped. Sending one of the seventeen back through the routing that rejected it will dead-letter it again after three retries — that root cause is vikunja#63/#169.
 
-**Auth:** custom routes bypass the transport's bearer auth, so a shared-secret header is the gate — and these routes are deliberately outside it, because they are the operator surface:
+### Auth: per-client scoped tokens (since v0.11.0)
 
-- Send `X-Task-Queue-Secret: $TASK_QUEUE_API_SECRET` on every mutation.
-- The server compares it in constant time (`hmac.compare_digest`) and **fails closed** (401) when the secret is missing, wrong, or unconfigured.
-- The secret lives in an operator-managed env file outside the repo, injected via `env_file` into the container and into each client's environment — never committed to source.
+Each client has its own token and its own scopes. The server stores only the token's sha256 digest:
+
+```bash
+TASK_QUEUE_CLIENT_CLOUDCLI=sha256:<64 lowercase hex>
+TASK_QUEUE_CLIENT_SCOPES_CLOUDCLI=read,operator-write
+```
+
+- **Scopes:** `read` (the `GET` routes) and `operator-write` (the `POST` routes). The vocabulary is closed, and neither scope implies the other.
+- **Channel name:** the suffix, lowercased with `_` → `-` (`MATRIX_BOT` → `matrix-bot`), the same rule agent names use.
+- **Header:** send the plaintext token as `X-Task-Queue-Token: <token>`. **Never `Authorization`.** FastMCP's authentication middleware runs on every route, not only `/mcp`, and would offer a bearer to the agent-token verifier. These routes read their own header and ignore whatever FastMCP authenticated, so a valid agent bearer grants nothing here, and a client token grants nothing on `/mcp`.
+- **Comparison:** the presented token is hashed and compared against every configured digest with `hmac.compare_digest`.
+- **Logging:** refusals and writes are logged with the channel name, never the token or its digest.
+
+Mint a client token and its digest:
+
+```bash
+python -c "import secrets, hashlib; t = secrets.token_urlsafe(32); print(t); print('sha256:' + hashlib.sha256(t.encode()).hexdigest())"
+```
+
+Give the first line to the client, in a file only it reads, and put the second in the server's environment.
+
+**Why digests.** If the server held plaintext client tokens, anything that can read its env file could take any client's credential. With digests, reading the server's configuration yields nothing a request can use. A client whose plaintext lives under a separate OS user gets a real boundary from that. A client whose token file is readable by the same user as the agents on the host gets containment and attribution only: the token is revocable and no longer sits in every process's environment. It is not a boundary.
+
+The server **refuses to start** on a malformed digest, a digest shared by two clients, a digest or scopes line without its partner, an empty or unknown scope, a channel named `operator` or `legacy-shared` or after an agent identity, or a client digest equal to an agent token's. Zero clients is valid: every custom route then refuses every request, and `/mcp` is unaffected.
+
+**Legacy shared secret (v0.11.0 only).** If `TASK_QUEUE_API_SECRET` is set, `X-Task-Queue-Secret` is still accepted as channel `legacy-shared` with both scopes, with a deprecation warning at startup and on every use. It exists only so the server can be deployed before its clients move. If `X-Task-Queue-Token` is present it decides the request alone, so a wrong token never falls back to the secret. **v0.12.0 removes it.**
 
 ## Deployment
 
@@ -359,7 +411,9 @@ The container mounts only the task-queue directory read-write. The rest of the f
 | `TASK_QUEUE_DIR` | `/task-queue` | Path to the task queue directory inside the container |
 | `MCP_HOST` | `0.0.0.0` | Bind host for the HTTP server |
 | `MCP_PORT` | `8485` | Port for the HTTP server |
-| `TASK_QUEUE_API_SECRET` | — | Shared secret for the HTTP control API. **Required** for any control-API mutation — fails closed (401) if unset. The MCP tools themselves do not use it. |
+| `TASK_QUEUE_CLIENT_<NAME>` | — | `sha256:<hex>` digest of one HTTP client's token, e.g. `TASK_QUEUE_CLIENT_CLOUDCLI`. Needs a matching `TASK_QUEUE_CLIENT_SCOPES_<NAME>`. See [Auth](#auth-per-client-scoped-tokens-since-v0110). |
+| `TASK_QUEUE_CLIENT_SCOPES_<NAME>` | — | Comma-separated scopes for that client: `read`, `operator-write`, or both. |
+| `TASK_QUEUE_API_SECRET` | — | **Deprecated; removed in v0.12.0.** The pre-v0.11.0 shared secret, still accepted as channel `legacy-shared` while clients migrate. |
 | `TASK_QUEUE_TOKEN_<AGENT>` | — | Bearer token for one calling agent, e.g. `TASK_QUEUE_TOKEN_DEVELOPER`. **At least one is required** — the HTTP transport refuses to start with none. The suffix becomes the agent identity, lowercased with `_` → `-` (`TASK_QUEUE_TOKEN_DOC_HEALTH` → `doc-health`). |
 
 Each agent needs its **own** token — the token is what identifies the caller, so sharing one
@@ -402,14 +456,14 @@ python -m pytest --cov=src --cov-report=term-missing
 TASK_QUEUE_DIR=~/.claude/task-queue python -m src.server
 ```
 
-The test suite covers every tool and the HTTP control API — validation edge cases, adversarial YAML strings, illegal transitions, the park/unpark round-trip, `amend_task` authorization (including the rejected target agent), operator-override auditing, out-of-vocabulary status repair, and the shared-secret gate (missing/wrong secret → 401). All writes use `yaml.dump` — never string interpolation — to prevent YAML injection.
+The test suite covers every tool and the HTTP control API — validation edge cases, adversarial YAML strings, illegal transitions, the park/unpark round-trip, `amend_task` authorization (including the rejected target agent), operator-override auditing, out-of-vocabulary status repair, and the client-token scope gate (every custom route, enumerated from the app: no token → 401, wrong scope → 403, an agent bearer → 401). `tests/conftest.py` strips every task-queue credential variable from the environment before collection, so running the suite from a shell that holds real tokens neither uses them nor prints them. All writes use `yaml.dump` — never string interpolation — to prevent YAML injection.
 
 ## Security
 
 Both surfaces on port 8485 require a credential:
 
 - **MCP tool path** (`/mcp`) — a per-agent bearer token, verified by FastMCP's `StaticTokenVerifier`. Missing or unknown token → 401. The transport refuses to start with no tokens configured, so this cannot silently fail open.
-- **HTTP control routes** (`/tasks/...`, `/queue/summary`) — a shared-secret header (`X-Task-Queue-Secret`, constant-time compare, fail-closed). See [HTTP Control API](#http-control-api).
+- **HTTP control and read routes** (`/tasks...`, `/queue/summary`) — a per-client token in `X-Task-Queue-Token`, stored server-side as a sha256 digest, with a `read` or `operator-write` scope per route. See [HTTP Control and Read API](#http-control-and-read-api).
 
 The container runs as UID 1000 with `cap_drop: ALL`, `no-new-privileges`, and a read-only rootfs (only `/task-queue` is writable).
 

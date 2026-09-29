@@ -248,6 +248,20 @@ def _public_task(task: dict) -> dict:
     return public
 
 
+# Recorded on history entries written through the HTTP control routes: which client made
+# the change. `actor` stays OPERATOR_ACTOR for all of them, because every one of those
+# clients acts as the operator. `channel` answers the question actor cannot: whether it
+# was the panel, the CloudCLI plugin or the Matrix bot. MCP tool calls pass nothing and
+# write no key, and existing records are never rewritten.
+CHANNEL_KEY = "channel"
+
+
+def _attribute(entry: dict, channel: str | None) -> dict:
+    if channel is not None:
+        entry[CHANNEL_KEY] = channel
+    return entry
+
+
 def _write_task_atomic(path: str, data: dict) -> None:
     """Write task data atomically: write to .tmp then os.rename() to final path."""
     tmp = path + ".tmp"
@@ -507,21 +521,23 @@ def submit_task_handler(
     return result
 
 
-def list_tasks_handler(
-    target_agent: str | None = None,
-    source_agent: str | None = None,
-    status: str | None = None,
-    task_type: str | None = None,
-    include_archived: bool = False,
-    include_dead_letters: bool = False,
-    limit: int = 20,
-    queue_dir: str | None = None,
-) -> list:
-    if queue_dir is None:
-        queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
+def _matching_tasks(
+    target_agent: str | None,
+    source_agent: str | None,
+    status: str | None,
+    task_type: str | None,
+    include_archived: bool,
+    include_dead_letters: bool,
+    queue_dir: str,
+) -> list[dict]:
+    """
+    Every record that matches the filters, sorted, with no limit applied.
 
-    limit = max(1, min(limit, 200))
-
+    Shared by list_tasks_handler and list_tasks_page_handler. Truncation is left to the
+    callers because only one of them has to say it happened: the MCP tool's output is a
+    bare list and stays that way, while the HTTP read API reports how many records matched.
+    Raises ValueError on an unrecognised status.
+    """
     # Reject an unrecognised status rather than filtering on it and returning [].
     #
     # This used to be permissive, and the silence cost real work: writer/CLAUDE.md swept its
@@ -618,8 +634,84 @@ def list_tasks_handler(
         return (1 if t.get("_location") == LOCATION_DEAD_LETTER else 0, created)
 
     filtered.sort(key=_sort_key, reverse=True)
+    return filtered
 
-    return [_public_task(t) for t in filtered[:limit]]
+
+# The MCP tool's ceiling. The HTTP read API has its own, higher one (LIST_PAGE_MAX).
+LIST_TASKS_MAX = 200
+
+# The HTTP read API's ceiling. The Matrix bot reads the whole active queue in one call, and
+# the active queue held 535 records on 2026-09-27. A client that needs more than this should
+# say so and why rather than have the cap raised quietly.
+LIST_PAGE_MAX = 1000
+
+
+def list_tasks_handler(
+    target_agent: str | None = None,
+    source_agent: str | None = None,
+    status: str | None = None,
+    task_type: str | None = None,
+    include_archived: bool = False,
+    include_dead_letters: bool = False,
+    limit: int = 20,
+    queue_dir: str | None = None,
+) -> list:
+    if queue_dir is None:
+        queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
+
+    limit = max(1, min(limit, LIST_TASKS_MAX))
+    matched = _matching_tasks(
+        target_agent,
+        source_agent,
+        status,
+        task_type,
+        include_archived,
+        include_dead_letters,
+        queue_dir,
+    )
+    return [_public_task(t) for t in matched[:limit]]
+
+
+def list_tasks_page_handler(
+    target_agent: str | None = None,
+    source_agent: str | None = None,
+    status: str | None = None,
+    task_type: str | None = None,
+    include_archived: bool = False,
+    include_dead_letters: bool = False,
+    limit: int = 200,
+    queue_dir: str | None = None,
+) -> dict:
+    """
+    list_tasks for the HTTP read API: the same records, plus what the limit cut off.
+
+    Returns {tasks, count, truncated}. `count` is the number of records that MATCHED, not
+    the number returned, and `truncated` is true whenever it exceeds `len(tasks)`. The MCP
+    tool returns a bare list and cannot say it truncated; that silence is how a
+    dead-letter listing once returned 200 rows and none of the records it was asked for
+    (see _matching_tasks's sort). A client reading over HTTP gets told.
+
+    Raises ValueError on an unrecognised status, like list_tasks_handler.
+    """
+    if queue_dir is None:
+        queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
+
+    limit = max(1, min(limit, LIST_PAGE_MAX))
+    matched = _matching_tasks(
+        target_agent,
+        source_agent,
+        status,
+        task_type,
+        include_archived,
+        include_dead_letters,
+        queue_dir,
+    )
+    page = matched[:limit]
+    return {
+        "tasks": [_public_task(t) for t in page],
+        "count": len(matched),
+        "truncated": len(matched) > len(page),
+    }
 
 
 def get_task_handler(task_id: str, queue_dir: str | None = None) -> dict:
@@ -655,6 +747,7 @@ def update_task_handler(
     output: str | None = None,
     queue_dir: str | None = None,
     on_behalf_of: str | None = None,
+    channel: str | None = None,
 ) -> dict:
     """
     Transition a task and append a history entry.
@@ -669,8 +762,8 @@ def update_task_handler(
 
     So the operator may close another agent's task, but must say whose it is, and the
     history records both — `actor: operator` alongside `on_behalf_of: <agent>`. Reachable
-    only where OPERATOR_ACTOR can be asserted, which after this release is the
-    shared-secret-gated control routes and nowhere else.
+    only where OPERATOR_ACTOR can be asserted, which is the HTTP control routes (client
+    token with the operator-write scope) and nowhere else.
     """
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
@@ -767,6 +860,7 @@ def update_task_handler(
         }
         if on_behalf_of is not None:
             history_entry["on_behalf_of"] = on_behalf_of
+        _attribute(history_entry, channel)
         if task.get("history") is None:
             task["history"] = []
         task["history"].append(history_entry)
@@ -930,6 +1024,7 @@ def set_task_status_handler(
     allow_override: bool = False,
     queue_dir: str | None = None,
     enforce_ownership: bool = False,
+    channel: str | None = None,
 ) -> dict:
     """
     Operator-facing status change. Broader than update_task but audited and bounded:
@@ -1068,6 +1163,7 @@ def set_task_status_handler(
             history_entry["override"] = True
         if repair_ok:
             history_entry["repaired_from"] = current_status
+        _attribute(history_entry, channel)
         if task.get("history") is None:
             task["history"] = []
         task["history"].append(history_entry)
@@ -1092,6 +1188,7 @@ def cancel_task_handler(
     actor: str,
     note: str = "",
     queue_dir: str | None = None,
+    channel: str | None = None,
 ) -> dict:
     """
     Cancel a task: a graceful, audited terminal state for stale/unwanted tasks.
@@ -1104,6 +1201,7 @@ def cancel_task_handler(
         actor=actor,
         note=note or "Cancelled by operator",
         queue_dir=queue_dir,
+        channel=channel,
     )
 
 
@@ -1113,6 +1211,7 @@ def park_task_handler(
     note: str = "",
     queue_dir: str | None = None,
     enforce_ownership: bool = False,
+    channel: str | None = None,
 ) -> dict:
     """
     Park a task: pause it without hiding it. The YAML stays exactly where it is and the
@@ -1129,6 +1228,7 @@ def park_task_handler(
         note=note or "Parked by operator",
         queue_dir=queue_dir,
         enforce_ownership=enforce_ownership,
+        channel=channel,
     )
 
 
@@ -1139,6 +1239,7 @@ def unpark_task_handler(
     status: str | None = None,
     queue_dir: str | None = None,
     enforce_ownership: bool = False,
+    channel: str | None = None,
 ) -> dict:
     """
     Unpark a task, returning it to the status it was parked from. Pass `status` to send it
@@ -1193,6 +1294,7 @@ def unpark_task_handler(
         allow_override=True,
         queue_dir=queue_dir,
         enforce_ownership=enforce_ownership,
+        channel=channel,
     )
 
 
@@ -1202,6 +1304,7 @@ def amend_task_handler(
     actor: str,
     reason: str = "",
     queue_dir: str | None = None,
+    channel: str | None = None,
 ) -> dict:
     """
     Append an amendment to a queued task. Append-only by construction: the original
@@ -1287,12 +1390,15 @@ def amend_task_handler(
 
         now = _now()
         amendments.append(
-            {
-                "timestamp": now,
-                "actor": actor,
-                "reason": reason,
-                "text": amendment,
-            }
+            _attribute(
+                {
+                    "timestamp": now,
+                    "actor": actor,
+                    "reason": reason,
+                    "text": amendment,
+                },
+                channel,
+            )
         )
 
         history_entry = {
@@ -1302,6 +1408,7 @@ def amend_task_handler(
             "note": reason or "Task amended",
             "action": "amend",
         }
+        _attribute(history_entry, channel)
         if task.get("history") is None:
             task["history"] = []
         task["history"].append(history_entry)
@@ -1330,6 +1437,7 @@ def requeue_dead_letter_handler(
     actor: str,
     note: str = "",
     queue_dir: str | None = None,
+    channel: str | None = None,
 ) -> dict:
     """
     Move a dead-lettered task back into the active queue at `submitted`.
@@ -1435,6 +1543,7 @@ def requeue_dead_letter_handler(
             # this, a requeued task carries no trace of why it was ever dead, and the
             # second drop reads as the first.
             history_entry["cleared_failed_reason"] = failed_reason["reason"]
+        _attribute(history_entry, channel)
         if task.get("history") is None:
             task["history"] = []
         task["history"].append(history_entry)
