@@ -27,6 +27,25 @@ Include as much detail as possible: the affected component, steps to reproduce, 
   (operator-controlled trust boundaries, not input attack surfaces)
 - Theoretical weaknesses without a realistic attack path against the MCP tool surface
 
+## Authentication model
+
+Port 8485 serves two surfaces with separate credentials:
+
+- **`/mcp` (agents):** a per-agent bearer token in `Authorization`. It authenticates the
+  caller and names it; `actor` is derived from it.
+- **`/tasks…` and `/queue/summary` (operator clients):** a per-client token in
+  `X-Task-Queue-Token`, with a `read` or `operator-write` scope required per route. The
+  server stores only `sha256:` digests of client tokens. An agent bearer grants nothing on
+  these routes, and a client token grants nothing on `/mcp`.
+
+These contain a mistaken or prompt-injected agent acting through its own tool surface. They
+are not a boundary against a process running as the same OS user that owns the token files.
+A client token is only a boundary when its plaintext is held by a different OS user from the
+agents. See the README's Trust model section.
+
+Reports that assume the attacker can read the operator's env or token files as the owning
+user are out of scope under "attacker control of configuration environment variables" below.
+
 ## Response Expectations
 
 | Stage | Timeline |

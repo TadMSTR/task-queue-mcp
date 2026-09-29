@@ -4,6 +4,61 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-29
+
+Scoped client tokens and a read API for the HTTP routes. Build
+`operator-panel-2026-09-p2-queue-read-api`; closes vikunja#568, absorbs vikunja#396 on
+this side (the shared secret leaves forge when the clients move, not at this release).
+
+Until now one shared secret, `TASK_QUEUE_API_SECRET`, gated every custom route, including
+the only read route. Nothing could read the queue over HTTP without also being able to
+write it, so every client read the YAML directly, with its own copy of the TTL,
+dead-letter and status rules. The secret was also ambient: on forge a `/proc` sweep found
+it in 23 processes, including every Claude session CloudCLI launched.
+
+### Added
+- **Per-client scoped tokens.** `TASK_QUEUE_CLIENT_<NAME>=sha256:<hex>` plus
+  `TASK_QUEUE_CLIENT_SCOPES_<NAME>=read|operator-write|read,operator-write`. The server
+  stores only digests, so reading its env file yields no usable credential. Scopes are a
+  closed vocabulary and neither implies the other. The server refuses to start on a
+  malformed or shared digest, a digest or scopes line without its partner, an empty or
+  unknown scope, a reserved channel (`operator`, `legacy-shared`), a channel named after an
+  agent, or a client digest equal to an agent token's.
+- **`X-Task-Queue-Token`** carries client tokens, never `Authorization`. FastMCP's
+  `AuthenticationMiddleware` runs on every route, not only `/mcp`, so a valid agent bearer
+  does authenticate a custom-route request at the Starlette layer. The routes now ignore
+  that entirely; an agent bearer on any custom route is a 401.
+- **`GET /tasks`**, over `list_tasks`: same filters, plus `limit` up to 1000, and
+  `{ok, tasks, count, truncated}`. `count` is the number of records that matched, and
+  `truncated` is true when that exceeds what was returned. An invalid status, an unknown
+  query parameter, a non-boolean flag or an out-of-range limit is a 400.
+- **`GET /tasks/{id}`**, over `get_task` (queue, archive, dead letters). `{ok, task}`,
+  400 on a malformed id, 404 when not found.
+- **`channel` on history entries** written through the HTTP routes, and on amendment
+  records. `actor` stays `operator`; `channel` records which client. MCP tool writes carry
+  none, and existing records are not rewritten.
+- **`tests/conftest.py`** strips every `TASK_QUEUE_TOKEN_*`, `TASK_QUEUE_CLIENT_*` and
+  `TASK_QUEUE_API_SECRET` before collection (vikunja#568). Before this, running the suite
+  from a shell holding the real tokens used them, and a failing assertion printed them.
+
+### Changed
+- **`GET /queue/summary` now requires the `read` scope.** Behaviour change: a client
+  holding only `operator-write` gets 403. The response body is unchanged.
+- Every `POST` route requires `operator-write`. A valid token without the route's scope is
+  403 `{"ok": false, "error": "scope <x> required"}`; no valid token is 401.
+- `list_tasks_handler` was split so the HTTP route can count matches. The MCP tool's output
+  is unchanged: a bare list, capped at 200.
+- Custom-route responses serialise timestamps as ISO 8601 strings, as the MCP transport
+  does.
+
+### Deprecated
+- **`TASK_QUEUE_API_SECRET` / `X-Task-Queue-Secret`.** Still accepted in this release as
+  channel `legacy-shared` with both scopes, so the server can deploy before its clients
+  move. A warning is logged at startup and on every use. If `X-Task-Queue-Token` is
+  present it decides the request alone and never falls back. A secret shorter than 16
+  characters is ignored, with a startup warning, rather than granting both scopes.
+  **Removed in v0.12.0.**
+
 ## [0.10.0] - 2026-08-29
 
 Make the dead-letter path visible. Build `agent-workflow-interop-2026-08` Phase 1;

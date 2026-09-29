@@ -41,12 +41,15 @@ Terminal statuses: `completed`, `failed`, `cancelled`. Transitions are validated
 
 ```
 src/
-  server.py         FastMCP server — 9 tools + the HTTP control API custom routes,
+  server.py         FastMCP server — 9 tools + the HTTP control/read API custom routes
+                    (each registered with one required scope via _control_route),
                     lifespan checks TASK_QUEUE_DIR exists
+  auth.py           agent bearer tokens for /mcp; client token digests + scopes for
+                    the custom routes (load_client_tokens, authorize_client)
   tools/
     queue.py        submit/list/get/update/set_task_status/cancel/park/unpark/
                     amend _handler — all file I/O on TASK_QUEUE_DIR
-tests/              pytest tests
+tests/              pytest tests; conftest.py strips every credential variable first
 Dockerfile          Container image — TASK_QUEUE_DIR must be a mounted volume
 pyproject.toml
 requirements.txt
@@ -57,11 +60,18 @@ requirements.txt
 | Env var           | Default        | Purpose                                          |
 |-------------------|----------------|--------------------------------------------------|
 | `TASK_QUEUE_DIR`  | `/task-queue`  | Directory for task YAML files (mount a volume)   |
+| `TASK_QUEUE_TOKEN_<AGENT>` | — | Agent bearer token for `/mcp` (at least one required) |
+| `TASK_QUEUE_CLIENT_<NAME>` + `TASK_QUEUE_CLIENT_SCOPES_<NAME>` | — | HTTP client token **digest** (`sha256:<hex>`) and its scopes (`read`, `operator-write`) |
+| `TASK_QUEUE_API_SECRET` | — | Deprecated shared secret, accepted as channel `legacy-shared` in v0.11.0 only |
 
 ## Architecture decisions
 
 - **YAML files as the queue** — no database. Each task is one file named `<timestamp>-<slug>.yml`. The queue is human-inspectable with standard tools and survives container restarts without any migration.
 - **No in-process state** — all operations read/write files directly. Multiple server instances can safely share a queue directory via NFS or bind mount.
+- **Two credentials, two surfaces, no overlap.** `/mcp` takes an agent bearer in `Authorization`. The custom routes take a client token in `X-Task-Queue-Token` and ignore `request.user`: FastMCP's `AuthenticationMiddleware` runs app-wide, so an agent bearer *does* authenticate a custom-route request at the Starlette layer, and only `/mcp` enforces it. Do not read `request.user` or `get_access_token()` in a custom route, and do not move client tokens to `Authorization`.
+- **The server stores client token digests, never tokens.** Its env file is readable by the user every agent runs as. A new client gets a token minted outside this repo; only `sha256:<hex>` goes in the server's env.
+- **A new custom route goes through `_control_route(path, method, scope)`.** `tests/test_client_tokens.py` enumerates the app's routes and fails if one has no scope, and a new write route also needs a `channel` test.
+- **Never assert on a token map.** A failing `==` prints the keys, and the keys are tokens (vikunja#568). Compare identities or channel names.
 - **Fail-fast on missing dir** — the server exits at startup if `TASK_QUEUE_DIR` does not exist. This prevents tasks from being silently dropped due to a missing volume mount.
 - **The queue is three directories, and every reader must know it.** The queue root, `archive/`, and `dead-letters/` — the last written by the dispatcher when a task exhausts its routing retries. Until v0.10.0 nothing here could see into `dead-letters/`: `get_task` searched the root then `archive/` and answered `not found`, `list_tasks` globbed the root, `/queue/summary` counted the root. Seventeen tasks accumulated there over three months, every one a security audit request, all seventeen carrying the identical `failed_reason`, and the only notice any of them got was one Matrix message at the moment it was dropped (vikunja#557). A failure path nothing can enumerate is a failure path nobody checks. Loaded records carry `_location`; callers see it as `queue_location`.
 - **A dead letter is visible but not deliverable.** `include_dead_letters` is off by default and is *not* implied by `include_archived`: an agent's work sweep is a `list_tasks` call, and re-delivering seventeen unroutable records into it is the opposite of what the visibility is for. Two properties make the flag work on a real queue, and both were found by running it against one — dead letters are exempt from the TTL filter (they carry terminal `failed`, and the live ones are months past `ttl_days`, so without it the flag returns an empty list), and they sort *first* when included (they are the oldest records by construction, so `limit` would otherwise discard every one; measured at 200 rows and zero dead letters).
