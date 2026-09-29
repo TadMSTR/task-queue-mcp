@@ -10,10 +10,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from src.auth import (
-    LEGACY_CHANNEL,
-    LEGACY_SECRET_ENV,
-    LEGACY_SECRET_HEADER,
-    MIN_TOKEN_LENGTH,
+    RETIRED_SECRET_ENV,
     SCOPE_OPERATOR_WRITE,
     SCOPE_READ,
     TOKEN_ENV_PREFIX,
@@ -22,11 +19,10 @@ from src.auth import (
     authorize_client,
     bind_actor,
     build_verifier,
-    legacy_secret_configured,
-    legacy_secret_too_short,
     load_agent_tokens,
     load_client_tokens,
     require_operator_surface,
+    retired_secret_set,
 )
 from src.tools.queue import (
     LIST_PAGE_MAX,
@@ -808,20 +804,13 @@ if __name__ == "__main__":
         )
         or "none — every control and read route will refuse",
     )
-    if legacy_secret_too_short():
+    if retired_secret_set():
+        # Reported, never honoured. Loud because a leftover copy of this variable is the
+        # ambient credential v0.11.0-v0.12.0 existed to remove (vikunja#396).
         logger.warning(
-            "control API: %s is set but shorter than %d characters, so it is ignored. "
-            "%s requests will be refused.",
-            LEGACY_SECRET_ENV,
-            MIN_TOKEN_LENGTH,
-            LEGACY_SECRET_HEADER,
-        )
-    if legacy_secret_configured():
-        logger.warning(
-            "control API: %s is set. %s is still accepted as channel %s with read and "
-            "operator-write. This is deprecated and removed in v0.12.0.",
-            LEGACY_SECRET_ENV,
-            LEGACY_SECRET_HEADER,
-            LEGACY_CHANNEL,
+            "control API: %s is set but IGNORED: the shared secret was removed in v0.12.0 "
+            "and grants nothing. Delete it from this service's environment and anything "
+            "that shares its env file.",
+            RETIRED_SECRET_ENV,
         )
     mcp.run(transport="streamable-http", host=host, port=port)

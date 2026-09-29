@@ -62,7 +62,7 @@ requirements.txt
 | `TASK_QUEUE_DIR`  | `/task-queue`  | Directory for task YAML files (mount a volume)   |
 | `TASK_QUEUE_TOKEN_<AGENT>` | — | Agent bearer token for `/mcp` (at least one required) |
 | `TASK_QUEUE_CLIENT_<NAME>` + `TASK_QUEUE_CLIENT_SCOPES_<NAME>` | — | HTTP client token **digest** (`sha256:<hex>`) and its scopes (`read`, `operator-write`) |
-| `TASK_QUEUE_API_SECRET` | — | Deprecated shared secret, accepted as channel `legacy-shared` in v0.11.0 only |
+| `TASK_QUEUE_API_SECRET` | — | Removed in v0.12.0; ignored with a startup warning. Never re-add a path that honours it |
 
 ## Architecture decisions
 

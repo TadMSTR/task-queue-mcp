@@ -201,22 +201,36 @@ def test_correct_bearer_token_is_accepted(authed_server):
     assert resp.headers.get("mcp-session-id")
 
 
-def test_control_routes_stay_on_the_shared_secret(authed_server, monkeypatch):
+def test_control_routes_stay_on_their_own_token(authed_server, monkeypatch):
     """
     The control routes are the operator surface and are not gated by the /mcp bearer.
     Enabling MCP auth must neither open them nor start demanding a bearer token from their
-    clients. In v0.11.0 the legacy shared secret still opens them; the client-token gate
-    is covered in test_client_tokens.py.
+    clients: a client token in X-Task-Queue-Token opens them, and nothing else does. The
+    full scope matrix is in test_client_tokens.py.
     """
-    # At least MIN_TOKEN_LENGTH: a shorter legacy secret is ignored.
-    secret = "control-secret-value"
-    monkeypatch.setenv("TASK_QUEUE_API_SECRET", secret)
+    from src.auth import token_digest
+
+    client_token = "control-client-token-value"
+    monkeypatch.setattr(
+        authed_server,
+        "_client_tokens",
+        auth_mod.load_client_tokens(
+            env={
+                "TASK_QUEUE_CLIENT_OPS": token_digest(client_token),
+                "TASK_QUEUE_CLIENT_SCOPES_OPS": "read",
+            }
+        ),
+    )
 
     with TestClient(authed_server.mcp.http_app()) as client:
-        # No secret, no bearer -> still 401 from the shared-secret gate, not a 200.
+        # No token, no bearer -> 401 from the client-token gate, not a 200.
         assert client.get("/queue/summary").status_code == 401
-        # Correct secret, no bearer -> still works.
-        resp = client.get("/queue/summary", headers={"X-Task-Queue-Secret": secret})
+        # The agent bearer that opens /mcp opens nothing here.
+        assert (
+            client.get("/queue/summary", headers={"Authorization": f"Bearer {GOOD}"}).status_code
+            == 401
+        )
+        resp = client.get("/queue/summary", headers={"X-Task-Queue-Token": client_token})
 
     assert resp.status_code == 200
     assert resp.json()["ok"] is True

@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-29
+
+Remove the shared secret. Build `operator-panel-2026-09-p2-queue-read-api` Phase 5;
+vikunja#396. **Deploy only after every client sends `X-Task-Queue-Token`** (CloudCLI plugin
+v0.11.0, matrix-task-queue-bot v0.2.0).
+
+### Removed
+- **`TASK_QUEUE_API_SECRET` and the `X-Task-Queue-Secret` header.** The `legacy-shared`
+  path from v0.11.0 is gone. The header is never read as a credential. A request carrying
+  only the header gets a 401 and a log line naming it, so an unmigrated client is visible.
+
+### Changed
+- If `TASK_QUEUE_API_SECRET` is still set, the server logs a startup warning to delete it.
+  Setting it again re-enables nothing; a test starts the server with it set and checks
+  every custom route refuses the old header.
+- `legacy-shared` stays a reserved channel name, because v0.11.0 history entries carry it.
+
+
 ## [0.11.0] - 2026-09-29
 
 Scoped client tokens and a read API for the HTTP routes. Build
