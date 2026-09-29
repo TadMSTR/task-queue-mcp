@@ -55,7 +55,9 @@ it in 23 processes, including every Claude session CloudCLI launched.
 - **`TASK_QUEUE_API_SECRET` / `X-Task-Queue-Secret`.** Still accepted in this release as
   channel `legacy-shared` with both scopes, so the server can deploy before its clients
   move. A warning is logged at startup and on every use. If `X-Task-Queue-Token` is
-  present it decides the request alone and never falls back. **Removed in v0.12.0.**
+  present it decides the request alone and never falls back. A secret shorter than 16
+  characters is ignored, with a startup warning, rather than granting both scopes.
+  **Removed in v0.12.0.**
 
 ## [0.10.0] - 2026-08-29
 

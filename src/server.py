@@ -13,6 +13,7 @@ from src.auth import (
     LEGACY_CHANNEL,
     LEGACY_SECRET_ENV,
     LEGACY_SECRET_HEADER,
+    MIN_TOKEN_LENGTH,
     SCOPE_OPERATOR_WRITE,
     SCOPE_READ,
     TOKEN_ENV_PREFIX,
@@ -22,6 +23,7 @@ from src.auth import (
     bind_actor,
     build_verifier,
     legacy_secret_configured,
+    legacy_secret_too_short,
     load_agent_tokens,
     load_client_tokens,
     require_operator_surface,
@@ -806,6 +808,14 @@ if __name__ == "__main__":
         )
         or "none — every control and read route will refuse",
     )
+    if legacy_secret_too_short():
+        logger.warning(
+            "control API: %s is set but shorter than %d characters, so it is ignored. "
+            "%s requests will be refused.",
+            LEGACY_SECRET_ENV,
+            MIN_TOKEN_LENGTH,
+            LEGACY_SECRET_HEADER,
+        )
     if legacy_secret_configured():
         logger.warning(
             "control API: %s is set. %s is still accepted as channel %s with read and "

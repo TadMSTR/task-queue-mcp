@@ -1448,7 +1448,10 @@ def requeue_dead_letter_handler(
     three months. Resurrecting work is an operator judgement in the same way cancelling it
     is; an agent must not be able to bring back its own dropped request, or a routing bug
     becomes an agent-driven retry loop with no ceiling. The gate is enforced one level up,
-    in server.py, by the same `require_operator_surface` that gates set_task_status.
+    in server.py, on both surfaces that reach this handler: the MCP tool is refused for any
+    resolved agent identity by the same `require_operator_surface` that gates
+    set_task_status, and the HTTP route requires a client token with the `operator-write`
+    scope.
 
     The terminal-immutability rule is not weakened by this. It is scoped to the
     dead-letter directory and nowhere else: the record is looked up ONLY under

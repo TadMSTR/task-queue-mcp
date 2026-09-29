@@ -203,17 +203,20 @@ def test_correct_bearer_token_is_accepted(authed_server):
 
 def test_control_routes_stay_on_the_shared_secret(authed_server, monkeypatch):
     """
-    The control routes are custom_route handlers and sit outside the transport's auth
-    provider by design — they are the operator surface. Enabling MCP auth must neither
-    open them nor start demanding a bearer token from the CloudCLI plugin or Matrix bot.
+    The control routes are the operator surface and are not gated by the /mcp bearer.
+    Enabling MCP auth must neither open them nor start demanding a bearer token from their
+    clients. In v0.11.0 the legacy shared secret still opens them; the client-token gate
+    is covered in test_client_tokens.py.
     """
-    monkeypatch.setenv("TASK_QUEUE_API_SECRET", "control-secret")
+    # At least MIN_TOKEN_LENGTH: a shorter legacy secret is ignored.
+    secret = "control-secret-value"
+    monkeypatch.setenv("TASK_QUEUE_API_SECRET", secret)
 
     with TestClient(authed_server.mcp.http_app()) as client:
         # No secret, no bearer -> still 401 from the shared-secret gate, not a 200.
         assert client.get("/queue/summary").status_code == 401
         # Correct secret, no bearer -> still works.
-        resp = client.get("/queue/summary", headers={"X-Task-Queue-Secret": "control-secret"})
+        resp = client.get("/queue/summary", headers={"X-Task-Queue-Secret": secret})
 
     assert resp.status_code == 200
     assert resp.json()["ok"] is True

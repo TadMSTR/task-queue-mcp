@@ -31,10 +31,13 @@ from src.auth import (
     CLIENT_TOKEN_HEADER,
     LEGACY_CHANNEL,
     LEGACY_SECRET_HEADER,
+    MIN_TOKEN_LENGTH,
     SCOPE_OPERATOR_WRITE,
     SCOPE_READ,
     AuthConfigError,
     authorize_client,
+    legacy_secret_configured,
+    legacy_secret_too_short,
     load_client_tokens,
     token_digest,
 )
@@ -186,13 +189,16 @@ def test_a_bad_client_configuration_stops_the_server_at_import(monkeypatch):
 
     monkeypatch.setenv("TASK_QUEUE_CLIENT_X", "not-a-digest")
     monkeypatch.setenv("TASK_QUEUE_CLIENT_SCOPES_X", "read")
-    with pytest.raises(SystemExit) as exc:
+    try:
+        with pytest.raises(SystemExit) as exc:
+            importlib.reload(srv)
+        assert exc.value.code == 1
+    finally:
+        # Restore a clean module even if the reload did not exit, so later tests do not
+        # inherit this configuration.
+        monkeypatch.delenv("TASK_QUEUE_CLIENT_X", raising=False)
+        monkeypatch.delenv("TASK_QUEUE_CLIENT_SCOPES_X", raising=False)
         importlib.reload(srv)
-    assert exc.value.code == 1
-
-    monkeypatch.delenv("TASK_QUEUE_CLIENT_X")
-    monkeypatch.delenv("TASK_QUEUE_CLIENT_SCOPES_X")
-    importlib.reload(srv)
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +231,23 @@ def test_a_bad_client_token_does_not_fall_back_to_the_legacy_secret():
     headers = {CLIENT_TOKEN_HEADER: "wrong", LEGACY_SECRET_HEADER: LEGACY_SECRET}
     env = {"TASK_QUEUE_API_SECRET": LEGACY_SECRET}
     assert authorize_client(headers, clients, env=env) is None
+
+
+def test_a_legacy_secret_under_the_minimum_length_is_refused():
+    short = "x" * (MIN_TOKEN_LENGTH - 1)
+    env = {"TASK_QUEUE_API_SECRET": short}
+    assert legacy_secret_configured(env) is False
+    assert legacy_secret_too_short(env) is True
+    assert authorize_client({LEGACY_SECRET_HEADER: short}, {}, env=env) is None
+
+
+def test_a_legacy_secret_at_the_minimum_length_is_accepted():
+    ok = "x" * MIN_TOKEN_LENGTH
+    env = {"TASK_QUEUE_API_SECRET": ok}
+    assert legacy_secret_configured(env) is True
+    assert legacy_secret_too_short(env) is False
+    client = authorize_client({LEGACY_SECRET_HEADER: ok}, {}, env=env)
+    assert client is not None and client.channel == LEGACY_CHANNEL
 
 
 def test_a_non_ascii_legacy_header_is_refused_not_raised():

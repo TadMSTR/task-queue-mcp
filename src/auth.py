@@ -402,8 +402,21 @@ def load_client_tokens(
 
 
 def legacy_secret_configured(env: dict[str, str] | None = None) -> bool:
+    """
+    Whether the legacy shared secret is set AND long enough to accept.
+
+    A secret shorter than MIN_TOKEN_LENGTH is treated as unset: it would otherwise grant
+    both scopes to anything that can guess it. The same floor applies to agent tokens.
+    """
     env = os.environ if env is None else env
-    return bool(env.get(LEGACY_SECRET_ENV, ""))
+    return len(env.get(LEGACY_SECRET_ENV, "")) >= MIN_TOKEN_LENGTH
+
+
+def legacy_secret_too_short(env: dict[str, str] | None = None) -> bool:
+    """Set, but refused for being under MIN_TOKEN_LENGTH. For the startup warning."""
+    env = os.environ if env is None else env
+    value = env.get(LEGACY_SECRET_ENV, "")
+    return bool(value) and len(value) < MIN_TOKEN_LENGTH
 
 
 def authorize_client(
@@ -438,10 +451,10 @@ def authorize_client(
         return found
 
     env = os.environ if env is None else env
-    secret = env.get(LEGACY_SECRET_ENV, "")
     provided = headers.get(LEGACY_SECRET_HEADER)
-    if not secret or provided is None:
+    if provided is None or not legacy_secret_configured(env):
         return None
+    secret = env[LEGACY_SECRET_ENV]
     # Bytes, not str: compare_digest raises TypeError on non-ASCII str operands, and a
     # malformed header must not escape as a 500. (audit L-02)
     if not hmac.compare_digest(provided.encode("utf-8"), secret.encode("utf-8")):
