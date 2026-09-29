@@ -148,8 +148,21 @@ def _initialize_body():
 HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 
 
+def _identities(tokens: dict[str, str]) -> list[str]:
+    """
+    The identities in a token map, without its keys.
+
+    Assert on this, never on the map itself. A failing `==` on the map prints every key,
+    and the keys are tokens. With an ambient credential in the environment, that is a live
+    token in a CI log (vikunja#568).
+    """
+    return sorted(tokens.values())
+
+
 def test_token_is_loaded_into_the_server_module(authed_server):
-    assert authed_server._agent_tokens == {GOOD: "developer"}
+    assert _identities(authed_server._agent_tokens) == ["developer"]
+    loaded_the_configured_token = authed_server._agent_tokens.get(GOOD) == "developer"
+    assert loaded_the_configured_token
 
 
 def test_unauthenticated_mcp_request_is_refused(authed_server):
