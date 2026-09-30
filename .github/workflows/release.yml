@@ -156,7 +156,11 @@ jobs:
           echo "GET /queue/summary -> $summary"
           [ "$summary" = 200 ]
 
-          docker logs "$CONTAINER" 2>&1 | grep -q 'YAML loader: CSafeLoader' \
+          # Captured first, not piped: `docker logs | grep -q` under pipefail fails whenever
+          # grep exits on its match before docker logs has finished writing (SIGPIPE).
+          # That flaked 1 run in 12 on forge and once in CI.
+          logs=$(docker logs "$CONTAINER" 2>&1)
+          grep -qF 'YAML loader: CSafeLoader' <<<"$logs" \
             || { echo "startup log does not name CSafeLoader"; exit 1; }
           echo "startup log names CSafeLoader"
 
@@ -282,7 +286,9 @@ jobs:
           set -euo pipefail
           [ -n "$DIGEST" ] || { echo "publish-image produced no digest"; exit 1; }
           body=$(gh release view "$TAG_NAME" --json body -q .body)
-          if printf '%s' "$body" | grep -qF "$DIGEST"; then
+          # Here-strings, not pipes: under pipefail a `| grep -q` that matches early can
+          # SIGPIPE its writer and read as "not found", which would add the block twice.
+          if grep -qF "$DIGEST" <<<"$body"; then
             echo "Release $TAG_NAME already names $DIGEST."
             exit 0
           fi
@@ -299,4 +305,5 @@ jobs:
             printf '%s\n' "$body"
           } > "$notes"
           gh release edit "$TAG_NAME" --notes-file "$notes"
-          gh release view "$TAG_NAME" --json body -q .body | grep -qF "$DIGEST"
+          after=$(gh release view "$TAG_NAME" --json body -q .body)
+          grep -qF "$DIGEST" <<<"$after"

@@ -142,7 +142,11 @@ jobs:
           echo "GET /queue/summary -> $summary"
           [ "$summary" = 200 ]
 
-          docker logs "$CONTAINER" 2>&1 | grep -q 'YAML loader: CSafeLoader' \
+          # Captured first, not piped: `docker logs | grep -q` under pipefail fails whenever
+          # grep exits on its match before docker logs has finished writing (SIGPIPE).
+          # That flaked 1 run in 12 on forge and once in CI.
+          logs=$(docker logs "$CONTAINER" 2>&1)
+          grep -qF 'YAML loader: CSafeLoader' <<<"$logs" \
             || { echo "startup log does not name CSafeLoader"; exit 1; }
           echo "startup log names CSafeLoader"
 
