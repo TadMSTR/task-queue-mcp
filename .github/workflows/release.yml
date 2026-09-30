@@ -196,8 +196,11 @@ jobs:
           MINOR="$(echo "$V" | cut -d. -f1,2)"
 
           TAGS=("$REF_NAME" "$V")
+          # A prerelease is anything that is not plain digits and dots: `0.14.0-rc1` and
+          # PEP 440's hyphen-free `0.14.0rc1`, `0.14.0a1`, `0.14.0.dev1` alike. Matching
+          # only `*-*` would move :latest onto a PEP 440 prerelease (CR-01).
           case "$V" in
-            *-*) echo "prerelease $V: publishing exact tags only, not :$MINOR or :latest" ;;
+            *[!0-9.]*) echo "prerelease $V: publishing exact tags only, not :$MINOR or :latest" ;;
             *)   TAGS+=("$MINOR" "latest") ;;
           esac
 
