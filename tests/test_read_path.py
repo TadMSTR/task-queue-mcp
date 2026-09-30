@@ -314,3 +314,22 @@ def test_a_non_hex_prefix_never_reaches_a_glob_pattern(tmp_path, monkeypatch):
 
     assert task is not None and task["id"] == "../*/x-y"
     assert all(p.endswith("*.yml") for p in patterns), patterns
+
+
+def test_duplicate_id_misnamed_in_queue_returns_the_archive_copy(tmp_path):
+    # Pins the SECURITY[accepted] divergence in _find_task (CR-02). A misnamed live copy and
+    # a correctly named archived copy of one id: the fast path finds the archive copy first.
+    # If this starts failing, the precedence changed. Update the accepted-risk text, and
+    # check the cost, before changing the assertion.
+    r = _submit(tmp_path)
+    live = tmp_path / r["filename"]
+    archived = tmp_path / "archive" / r["filename"]
+    archived.parent.mkdir()
+    archived.write_text(live.read_text())
+    _set_status(archived, "completed")
+    os.replace(live, tmp_path / _misname(r["filename"]))
+
+    task = q._find_task(str(tmp_path), r["task_id"], include_archived=True)
+
+    assert task["_location"] == "archive"
+    assert task["status"] == "completed"

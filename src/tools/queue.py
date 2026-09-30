@@ -286,10 +286,15 @@ def _find_task(
     were written to remove; a filename-only lookup would bring it back. A fallback hit is
     logged, so misnamed files are visible and can be counted.
 
-    One divergence from the full scan, stated rather than hidden: if the same id existed
-    twice, misnamed in an earlier directory and correctly named in a later one, the fast
-    path returns the later copy. There were no duplicate ids on 2026-09-30, and
-    submit_task_handler mints a fresh uuid4 for every record.
+    SECURITY[accepted]: one divergence from the full scan. If the same id existed twice,
+    misnamed in an earlier directory and correctly named in a later one, the fast path
+    returns the later copy, and a mutation would write to it. No agent-facing path creates
+    a duplicate id: submit_task_handler mints a fresh uuid4 for every record, and there were
+    none on 2026-09-30. Only an external direct-YAML writer could, and that class of writer
+    already bypasses _task_lock. Closing it means a full scan of every earlier directory
+    before the fast path moves on, which puts back the whole-queue parse this function
+    exists to avoid. test_read_path pins the behaviour, so a change to it is deliberate.
+    Audit: 2026-09-30/task-queue-read-perf-2026-09-p1-api-read-path (CR-02, Low).
     """
     return _find_in(_queue_dirs(queue_dir, include_archived, include_dead_letters), task_id)
 
@@ -1339,10 +1344,19 @@ def unpark_task_handler(
     residual race is narrower: if a second operator re-parks or unparks this task between
     our read and that call, the stale `target` can produce a redundant-but-valid transition
     plus a duplicate history entry. An audit-trail nuisance, not a state-integrity or
-    authorization bypass. Accepted given park/unpark is a human clicking a button, not
-    concurrent automation. Closing it fully needs a reentrant lock or a
+    authorization bypass. Closing it fully needs a reentrant lock or a
     set_task_status_handler that accepts a pre-loaded task.
     (task-queue-park-amend-2026-08 audit, LOW)
+
+    Re-accepted 2026-09-30 on a narrower premise. The original acceptance said park/unpark
+    is a human clicking a button, not concurrent automation, and until v0.13.0 the HTTP
+    path enforced that: every control route ran on the event loop, so two HTTP unparks
+    could not interleave. Since v0.13.0 they run on worker threads, like MCP tool calls, so
+    a double-click or two open panels can now race here. Nothing structural stops it any
+    more; it rests on that being rare. The worst case is unchanged, because
+    set_task_status_handler re-validates under the lock: a redundant-but-valid transition
+    and a duplicate history entry. Audit: 2026-09-30/task-queue-read-perf-2026-09-p1-api-
+    read-path (F-01, Low).
     """
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")

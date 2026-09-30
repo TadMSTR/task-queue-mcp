@@ -46,7 +46,9 @@ against the same copy of forge's live queue (504 active, 1043 archive, 17 dead l
 ### Added
 - **Published image** `ghcr.io/tadmstr/task-queue-mcp`, built on every `v*` tag in
   `release.yml`. The job builds once, smoke-tests that exact image, then pushes `vX.Y.Z`
-  and `X.Y.Z`; `X.Y` and `latest` move only for non-prereleases. It then attests build
+  and `X.Y.Z`; `X.Y` and `latest` move only for
+  non-prereleases, meaning any version that is not plain digits and dots (so PEP 440's
+  `0.14.0rc1` counts as well as `0.14.0-rc1`). It then attests build
   provenance and verifies the attestation in the same job, because forge's `gh` cannot
   (vikunja#1004). The GitHub Release is cut after the image is published and names the
   pushed digest. The workflow also refuses a tag that does not match `pyproject.toml`.
@@ -57,6 +59,13 @@ against the same copy of forge's live queue (504 active, 1043 archive, 17 dead l
   (vikunja#362). A local build reports `dev` and `unknown`.
 
 No MCP tool signature or output schema changed, and no new environment variables.
+
+### Security
+- Audit `task-queue-read-perf-2026-09-p1-api-read-path`: 2 Low, 1 Info, no fixes needed in
+  runtime code. Two risks are accepted and documented where they live: the unpark race, now
+  reachable by two concurrent HTTP requests but with the same worst case, and duplicate-id
+  precedence in the fast lookup, which a test now pins. The release workflow's prerelease
+  detection was fixed before first use.
 
 ## [0.12.0] - 2026-09-29
 
