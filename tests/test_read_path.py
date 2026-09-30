@@ -295,3 +295,22 @@ def test_tmp_files_are_never_read(tmp_path):
     os.remove(tmp_path / r["filename"])
 
     assert get_task_handler(r["task_id"], queue_dir=str(tmp_path))["error"] == "not found"
+
+
+def test_a_non_hex_prefix_never_reaches_a_glob_pattern(tmp_path, monkeypatch):
+    # Callers validate ids as UUIDs; _find_task does not rely on it. A prefix carrying path
+    # or glob syntax skips the fast path entirely and is only ever compared, never globbed.
+    patterns = []
+    real_glob = q.glob.glob
+
+    def spy(pattern, *a, **kw):
+        patterns.append(pattern)
+        return real_glob(pattern, *a, **kw)
+
+    monkeypatch.setattr(q.glob, "glob", spy)
+    (tmp_path / "20260930-000000-deadbeef.yml").write_text(yaml.dump({"id": "../*/x-y"}))
+
+    task = q._find_task(str(tmp_path), "../*/x-y", include_archived=True)
+
+    assert task is not None and task["id"] == "../*/x-y"
+    assert all(p.endswith("*.yml") for p in patterns), patterns

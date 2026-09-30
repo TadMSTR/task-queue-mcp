@@ -2,6 +2,7 @@ import fcntl
 import glob
 import logging
 import os
+import re
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -258,6 +259,9 @@ def _queue_dirs(
     return dirs
 
 
+_ID_PREFIX_RE = re.compile(r"[0-9a-fA-F]{8}")
+
+
 def _find_task(
     queue_dir: str,
     task_id: str,
@@ -292,9 +296,14 @@ def _find_task(
 
 def _find_in(dirs: list[tuple[str, str]], task_id: str) -> dict | None:
     """_find_task's search over an explicit (directory, location) list."""
-    pattern = f"*-{glob.escape(task_id[:8])}.yml"
-    for directory, location in dirs:
-        for path in glob.glob(os.path.join(glob.escape(directory), pattern)):
+    # Every caller validates task_id as a UUID first, but the id becomes part of a glob
+    # pattern here, so the guard is co-located too: anything whose prefix is not 8 hex
+    # characters skips the fast path and goes to the exact-match scan, which never builds
+    # a path from it.
+    prefix = task_id[:8]
+    fast = _ID_PREFIX_RE.fullmatch(prefix) is not None
+    for directory, location in dirs if fast else []:
+        for path in glob.glob(os.path.join(glob.escape(directory), f"*-{prefix}.yml")):
             task = _load_task_file(path)
             if task is not None and task.get("id") == task_id:
                 task["_path"] = path

@@ -53,6 +53,7 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           docker build \
             --build-arg VERSION="${REF_NAME#v}" \
             --build-arg REVISION="$GITHUB_SHA" \
@@ -234,6 +235,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
+          set -euo pipefail
           {
             echo "### Published image"
             echo
