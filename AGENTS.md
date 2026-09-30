@@ -48,9 +48,15 @@ src/
                     the custom routes (load_client_tokens, authorize_client)
   tools/
     queue.py        submit/list/get/update/set_task_status/cancel/park/unpark/
-                    amend _handler — all file I/O on TASK_QUEUE_DIR
+                    amend _handler — all file I/O on TASK_QUEUE_DIR. Parse with
+                    _load_task_file (CSafeLoader), never yaml.safe_load; find one id
+                    with _find_task (filename fast path + full-scan fallback), never
+                    a filename-only lookup
 tests/              pytest tests; conftest.py strips every credential variable first
 Dockerfile          Container image — TASK_QUEUE_DIR must be a mounted volume
+.github/workflows/  ci.yml: tests + a `docker` job that builds and smoke-tests the image;
+                    release.yml: on v* tag, publish to ghcr.io/tadmstr/task-queue-mcp,
+                    attest + verify, then cut the GitHub Release with the digest
 pyproject.toml
 requirements.txt
 ```

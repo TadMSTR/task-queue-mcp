@@ -2,6 +2,7 @@ import fcntl
 import glob
 import logging
 import os
+import re
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -183,11 +184,26 @@ QUEUE_LOCATION_KEY = "queue_location"
 _CONTEXT_REF_MIN_LEN = 2  # at minimum "/<char>"
 
 
+# libyaml's C parser when PyYAML was built with it, the pure-Python one otherwise.
+#
+# `yaml.safe_load` never uses libyaml: it is hard-wired to the pure-Python SafeLoader
+# whatever `yaml.__with_libyaml__` says. On the live queue (1563 files, 2026-09-30) that was
+# 2.55 s per full parse against 0.23 s with CSafeLoader, and the two produced identical
+# output for every file. Every HTTP read parses the whole queue, so this was most of the
+# latency the CloudCLI tab saw after plugin v0.11.0 (vikunja#1003).
+#
+# The fallback keeps a PyYAML without libyaml working, slowly, rather than failing to
+# import. CI asserts libyaml is present in the published image.
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+YAML_LOADER_NAME = _YAML_LOADER.__name__
+
+
 def _load_task_file(path: str) -> dict | None:
     """Load a single YAML task file. Returns None on parse or type error."""
     try:
         with open(path) as f:
-            data = yaml.safe_load(f)
+            # A safe loader either way: CSafeLoader and SafeLoader build plain types only.
+            data = yaml.load(f, Loader=_YAML_LOADER)
         if isinstance(data, dict):
             return data
         return None
@@ -225,14 +241,94 @@ def _load_all_tasks(
     its work list. See list_tasks_handler.
     """
     tasks: list[dict] = []
-
-    _load_dir(queue_dir, LOCATION_QUEUE, tasks)
-    if include_archived:
-        _load_dir(os.path.join(queue_dir, ARCHIVE_DIRNAME), LOCATION_ARCHIVE, tasks)
-    if include_dead_letters:
-        _load_dir(os.path.join(queue_dir, DEAD_LETTER_DIRNAME), LOCATION_DEAD_LETTER, tasks)
-
+    for directory, location in _queue_dirs(queue_dir, include_archived, include_dead_letters):
+        _load_dir(directory, location, tasks)
     return tasks
+
+
+def _queue_dirs(
+    queue_dir: str, include_archived: bool, include_dead_letters: bool
+) -> list[tuple[str, str]]:
+    """(directory, location) pairs to search, in search order. Shared so _find_task
+    and _load_all_tasks cannot disagree about which copy of an id wins."""
+    dirs = [(queue_dir, LOCATION_QUEUE)]
+    if include_archived:
+        dirs.append((os.path.join(queue_dir, ARCHIVE_DIRNAME), LOCATION_ARCHIVE))
+    if include_dead_letters:
+        dirs.append((os.path.join(queue_dir, DEAD_LETTER_DIRNAME), LOCATION_DEAD_LETTER))
+    return dirs
+
+
+_ID_PREFIX_RE = re.compile(r"[0-9a-fA-F]{8}")
+
+
+def _find_task(
+    queue_dir: str,
+    task_id: str,
+    *,
+    include_archived: bool = False,
+    include_dead_letters: bool = False,
+) -> dict | None:
+    """
+    The record whose id is task_id, with _path/_location attached, or None.
+
+    Answers what `next(t for t in _load_all_tasks(...) if t["id"] == task_id)` would, with
+    the same directories and opt-ins, without parsing the whole archive to find one record.
+
+    Fast path: submit_task_handler names every file `<timestamp>-<id[:8]>.yml`, so only
+    files carrying that suffix are parsed. The full id is compared, never the prefix:
+    eight hex characters can collide.
+
+    Fallback: the queue has other direct-YAML writers, and not all of them follow that
+    naming. `archive/20260603-121702-856b868d.yml` holds id `741bf127-…`. So a fast-path
+    miss is followed by the full scan, and None is only returned after it. Answering
+    `not found` for a record on disk is the bug get_task_handler and DEAD_LETTER_REFUSAL
+    were written to remove; a filename-only lookup would bring it back. A fallback hit is
+    logged, so misnamed files are visible and can be counted.
+
+    SECURITY[accepted]: one divergence from the full scan. If the same id existed twice,
+    misnamed in an earlier directory and correctly named in a later one, the fast path
+    returns the later copy, and a mutation would write to it. No agent-facing path creates
+    a duplicate id: submit_task_handler mints a fresh uuid4 for every record, and there were
+    none on 2026-09-30. Only an external direct-YAML writer could, and that class of writer
+    already bypasses _task_lock. Closing it means a full scan of every earlier directory
+    before the fast path moves on, which puts back the whole-queue parse this function
+    exists to avoid. test_read_path pins the behaviour, so a change to it is deliberate.
+    Audit: 2026-09-30/task-queue-read-perf-2026-09-p1-api-read-path (CR-02, Low).
+    """
+    return _find_in(_queue_dirs(queue_dir, include_archived, include_dead_letters), task_id)
+
+
+def _find_in(dirs: list[tuple[str, str]], task_id: str) -> dict | None:
+    """_find_task's search over an explicit (directory, location) list."""
+    # Every caller validates task_id as a UUID first, but the id becomes part of a glob
+    # pattern here, so the guard is co-located too: anything whose prefix is not 8 hex
+    # characters skips the fast path and goes to the exact-match scan, which never builds
+    # a path from it.
+    prefix = task_id[:8]
+    fast = _ID_PREFIX_RE.fullmatch(prefix) is not None
+    for directory, location in dirs if fast else []:
+        for path in glob.glob(os.path.join(glob.escape(directory), f"*-{prefix}.yml")):
+            task = _load_task_file(path)
+            if task is not None and task.get("id") == task_id:
+                task["_path"] = path
+                task["_location"] = location
+                return task
+
+    for directory, location in dirs:
+        records: list[dict] = []
+        _load_dir(directory, location, records)
+        task = next((t for t in records if t.get("id") == task_id), None)
+        if task is not None:
+            logger.warning(
+                "task %s found only by full scan, in %s/%s: filename does not end in -%s.yml",
+                task_id,
+                location,
+                os.path.basename(task["_path"]),
+                task_id[:8],
+            )
+            return task
+    return None
 
 
 def _public_task(task: dict) -> dict:
@@ -306,9 +402,7 @@ def _task_lock(queue_dir: str, task_id: str):
 
 def _find_dead_letter(queue_dir: str, task_id: str) -> dict | None:
     """The dead-lettered record for task_id, with _path/_location attached, or None."""
-    records: list[dict] = []
-    _load_dir(os.path.join(queue_dir, DEAD_LETTER_DIRNAME), LOCATION_DEAD_LETTER, records)
-    return next((t for t in records if t.get("id") == task_id), None)
+    return _find_in([(os.path.join(queue_dir, DEAD_LETTER_DIRNAME), LOCATION_DEAD_LETTER)], task_id)
 
 
 # The refusal a mutating handler gives for a dead-lettered task. It is a distinct message
@@ -731,10 +825,9 @@ def get_task_handler(task_id: str, queue_dir: str | None = None) -> dict:
     # bug — a dropped audit request looked identical to an id that never existed. The
     # returned record keeps its `failed_reason` block and carries `queue_location`, so a
     # caller can tell a dead letter from live work without inspecting paths.
-    tasks = _load_all_tasks(queue_dir, include_archived=True, include_dead_letters=True)
-    for task in tasks:
-        if task.get("id") == task_id:
-            return _public_task(task)
+    task = _find_task(queue_dir, task_id, include_archived=True, include_dead_letters=True)
+    if task is not None:
+        return _public_task(task)
 
     return {"ok": False, "error": "not found"}
 
@@ -792,8 +885,7 @@ def update_task_handler(
         }
 
     with _task_lock(queue_dir, task_id):
-        tasks = _load_all_tasks(queue_dir, include_archived=True)
-        task = next((t for t in tasks if t.get("id") == task_id), None)
+        task = _find_task(queue_dir, task_id, include_archived=True)
 
         if task is None:
             return _not_found(queue_dir, task_id)
@@ -928,8 +1020,7 @@ def _auto_close_originating_task(
     convenience, and a failure here must not fail the submit that triggered it.
     """
     try:
-        tasks = _load_all_tasks(queue_dir, include_archived=True)
-        parent = next((t for t in tasks if t.get("id") == originating_task_id), None)
+        parent = _find_task(queue_dir, originating_task_id, include_archived=True)
 
         if parent is None:
             logger.warning(
@@ -1066,8 +1157,7 @@ def set_task_status_handler(
         return {"ok": False, "error": "actor must not be empty"}
 
     with _task_lock(queue_dir, task_id):
-        tasks = _load_all_tasks(queue_dir, include_archived=True)
-        task = next((t for t in tasks if t.get("id") == task_id), None)
+        task = _find_task(queue_dir, task_id, include_archived=True)
 
         if task is None:
             return _not_found(queue_dir, task_id)
@@ -1254,10 +1344,19 @@ def unpark_task_handler(
     residual race is narrower: if a second operator re-parks or unparks this task between
     our read and that call, the stale `target` can produce a redundant-but-valid transition
     plus a duplicate history entry. An audit-trail nuisance, not a state-integrity or
-    authorization bypass. Accepted given park/unpark is a human clicking a button, not
-    concurrent automation. Closing it fully needs a reentrant lock or a
+    authorization bypass. Closing it fully needs a reentrant lock or a
     set_task_status_handler that accepts a pre-loaded task.
     (task-queue-park-amend-2026-08 audit, LOW)
+
+    Re-accepted 2026-09-30 on a narrower premise. The original acceptance said park/unpark
+    is a human clicking a button, not concurrent automation, and until v0.13.0 the HTTP
+    path enforced that: every control route ran on the event loop, so two HTTP unparks
+    could not interleave. Since v0.13.0 they run on worker threads, like MCP tool calls, so
+    a double-click or two open panels can now race here. Nothing structural stops it any
+    more; it rests on that being rare. The worst case is unchanged, because
+    set_task_status_handler re-validates under the lock: a redundant-but-valid transition
+    and a duplicate history entry. Audit: 2026-09-30/task-queue-read-perf-2026-09-p1-api-
+    read-path (F-01, Low).
     """
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
@@ -1269,8 +1368,7 @@ def unpark_task_handler(
 
     # Resolve the target before taking the write lock — set_task_status_handler acquires
     # the same (non-reentrant) per-task lock.
-    tasks = _load_all_tasks(queue_dir, include_archived=True)
-    task = next((t for t in tasks if t.get("id") == task_id), None)
+    task = _find_task(queue_dir, task_id, include_archived=True)
     if task is None:
         return _not_found(queue_dir, task_id)
     if task.get("status") != "parked":
@@ -1342,8 +1440,7 @@ def amend_task_handler(
         }
 
     with _task_lock(queue_dir, task_id):
-        tasks = _load_all_tasks(queue_dir, include_archived=True)
-        task = next((t for t in tasks if t.get("id") == task_id), None)
+        task = _find_task(queue_dir, task_id, include_archived=True)
 
         if task is None:
             return _not_found(queue_dir, task_id)
