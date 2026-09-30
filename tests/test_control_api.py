@@ -2,7 +2,8 @@
 Tests for the HTTP control API (FastMCP custom routes on the shared port).
 
 Covers the happy path, transition validation surfacing through HTTP status codes,
-and — critically — the shared-secret gate (missing/wrong secret → 401, no mutation).
+and — critically — the client-token gate (missing/wrong token → 401, no mutation). The
+scope matrix and the route enumeration live in test_client_tokens.py.
 Exercised end-to-end via Starlette's TestClient against mcp.http_app().
 """
 
@@ -12,21 +13,26 @@ import pytest
 import yaml
 from starlette.testclient import TestClient
 
+from src.auth import token_digest
 from src.tools.queue import get_task_handler, submit_task_handler, update_task_handler
 
-SECRET = "test-secret-value"
-AUTH = {"X-Task-Queue-Secret": SECRET}
+TOKEN = "test-client-token-value-0123456789"
+AUTH = {"X-Task-Queue-Token": TOKEN}
 
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    """Reload src.server with QUEUE_DIR -> tmp and a known API secret."""
+    """Reload src.server with QUEUE_DIR -> tmp and one read+write client, `test`."""
+    monkeypatch.setenv("TASK_QUEUE_CLIENT_TEST", token_digest(TOKEN))
+    monkeypatch.setenv("TASK_QUEUE_CLIENT_SCOPES_TEST", "read,operator-write")
     import src.server as srv
 
     importlib.reload(srv)
     monkeypatch.setattr(srv, "QUEUE_DIR", str(tmp_path))
-    monkeypatch.setenv("TASK_QUEUE_API_SECRET", SECRET)
-    return srv, tmp_path
+    yield srv, tmp_path
+    monkeypatch.delenv("TASK_QUEUE_CLIENT_TEST", raising=False)
+    monkeypatch.delenv("TASK_QUEUE_CLIENT_SCOPES_TEST", raising=False)
+    importlib.reload(srv)
 
 
 @pytest.fixture
@@ -98,38 +104,39 @@ def test_approve_missing_secret_rejected(env, client):
     assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "submitted"
 
 
-def test_approve_wrong_secret_rejected(env, client):
+def test_approve_wrong_token_rejected(env, client):
     _, tmp_path = env
     tid = _seed(tmp_path)
     resp = client.post(
         f"/tasks/{tid}/approve",
-        headers={"X-Task-Queue-Secret": "wrong"},
+        headers={"X-Task-Queue-Token": "wrong"},
         json={"actor": "ted"},
     )
     assert resp.status_code == 401
     assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "submitted"
 
 
-def test_no_secret_configured_fails_closed(env, tmp_path, monkeypatch):
+def test_no_clients_configured_fails_closed(env, tmp_path, monkeypatch):
     srv, qdir = env
-    monkeypatch.delenv("TASK_QUEUE_API_SECRET", raising=False)
+    monkeypatch.setattr(srv, "_client_tokens", {})
     tid = _seed(qdir)
     with TestClient(srv.mcp.http_app()) as c:
         resp = c.post(f"/tasks/{tid}/approve", headers=AUTH, json={"actor": "ted"})
     assert resp.status_code == 401
+    assert get_task_handler(task_id=tid, queue_dir=str(qdir))["status"] == "submitted"
 
 
-def test_non_ascii_secret_header_rejected_cleanly(env, client):
-    """A non-ASCII secret header must yield a clean 401, not a 500 (audit L-02).
+def test_non_ascii_token_header_rejected_cleanly(env, client):
+    """A non-ASCII token header must yield a clean 401, not a 500 (audit L-02).
 
     Sent as latin-1 bytes — Starlette decodes request headers as latin-1, so the server
-    sees a non-ASCII str, which would make a str-based hmac.compare_digest raise TypeError.
+    sees a non-ASCII str. It is hashed as UTF-8 before any comparison.
     """
     _, tmp_path = env
     tid = _seed(tmp_path)
     resp = client.post(
         f"/tasks/{tid}/approve",
-        headers={"X-Task-Queue-Secret": "wrong-café".encode("latin-1")},
+        headers={"X-Task-Queue-Token": "wrong-café".encode("latin-1")},
         json={"actor": "ted"},
     )
     assert resp.status_code == 401
@@ -406,12 +413,12 @@ def test_requeue_requires_the_secret(env, client):
     assert (tmp_path / "dead-letters" / r["filename"]).is_file()
 
 
-def test_requeue_wrong_secret_is_rejected(env, client):
+def test_requeue_wrong_token_is_rejected(env, client):
     _, tmp_path = env
     r = _seed_result(tmp_path)
     tid = _dead_letter(tmp_path, r)
 
-    resp = client.post(f"/tasks/{tid}/requeue", headers={"X-Task-Queue-Secret": "wrong"}, json={})
+    resp = client.post(f"/tasks/{tid}/requeue", headers={"X-Task-Queue-Token": "wrong"}, json={})
 
     assert resp.status_code == 401
     assert (tmp_path / "dead-letters" / r["filename"]).is_file()

@@ -12,7 +12,7 @@ Each client now has its own token, stored server-side as a sha256 digest, with e
     nothing on these routes, and that a client token grants nothing on /mcp
   - GET /tasks reporting `count` and `truncated` honestly
   - `channel` on the history entry of every write route
-  - the transitional legacy shared secret
+  - the retired shared secret granting nothing, even when the variable is set again
 
 No assertion here compares a token map or prints a token. The tokens are test constants,
 but the habit is what #568 is about.
@@ -29,16 +29,14 @@ from starlette.testclient import TestClient
 
 from src.auth import (
     CLIENT_TOKEN_HEADER,
-    LEGACY_CHANNEL,
-    LEGACY_SECRET_HEADER,
-    MIN_TOKEN_LENGTH,
+    RETIRED_CHANNEL,
+    RETIRED_SECRET_HEADER,
     SCOPE_OPERATOR_WRITE,
     SCOPE_READ,
     AuthConfigError,
     authorize_client,
-    legacy_secret_configured,
-    legacy_secret_too_short,
     load_client_tokens,
+    retired_secret_set,
     token_digest,
 )
 from src.tools.queue import (
@@ -53,7 +51,7 @@ AGENT_TOKEN = "agent-token-" + "a" * 32
 READ_TOKEN = "read-token-" + "r" * 32
 WRITE_TOKEN = "write-token-" + "w" * 32
 BOTH_TOKEN = "both-token-" + "b" * 32
-LEGACY_SECRET = "legacy-shared-secret-value"
+RETIRED_SECRET = "retired-shared-secret-value"
 
 CLIENT_ENV = {
     "TASK_QUEUE_CLIENT_READER": token_digest(READ_TOKEN),
@@ -208,7 +206,7 @@ def test_a_bad_client_configuration_stops_the_server_at_import(monkeypatch):
 
 def test_authorize_client_resolves_a_known_token():
     clients = load_client_tokens(env=CLIENT_ENV)
-    client = authorize_client({CLIENT_TOKEN_HEADER: READ_TOKEN}, clients, env={})
+    client = authorize_client({CLIENT_TOKEN_HEADER: READ_TOKEN}, clients)
     assert client is not None
     assert client.channel == "reader"
 
@@ -216,43 +214,37 @@ def test_authorize_client_resolves_a_known_token():
 @pytest.mark.parametrize("headers", [{}, {CLIENT_TOKEN_HEADER: ""}, {CLIENT_TOKEN_HEADER: "nope"}])
 def test_authorize_client_refuses_missing_empty_and_unknown(headers):
     clients = load_client_tokens(env=CLIENT_ENV)
-    assert authorize_client(headers, clients, env={}) is None
+    assert authorize_client(headers, clients) is None
 
 
 def test_the_agent_bearer_header_is_never_read():
     """A client token offered as a bearer is not a client token."""
     clients = load_client_tokens(env=CLIENT_ENV)
     headers = {"Authorization": f"Bearer {BOTH_TOKEN}"}
-    assert authorize_client(headers, clients, env={}) is None
+    assert authorize_client(headers, clients) is None
 
 
-def test_a_bad_client_token_does_not_fall_back_to_the_legacy_secret():
+def test_the_retired_header_is_never_a_credential():
+    """v0.12.0: the shared-secret header authenticates nothing, whatever it carries."""
     clients = load_client_tokens(env=CLIENT_ENV)
-    headers = {CLIENT_TOKEN_HEADER: "wrong", LEGACY_SECRET_HEADER: LEGACY_SECRET}
-    env = {"TASK_QUEUE_API_SECRET": LEGACY_SECRET}
-    assert authorize_client(headers, clients, env=env) is None
+    assert authorize_client({RETIRED_SECRET_HEADER: RETIRED_SECRET}, clients) is None
+    # Not even alongside a client token's worth of nothing.
+    headers = {CLIENT_TOKEN_HEADER: "wrong", RETIRED_SECRET_HEADER: RETIRED_SECRET}
+    assert authorize_client(headers, clients) is None
 
 
-def test_a_legacy_secret_under_the_minimum_length_is_refused():
-    short = "x" * (MIN_TOKEN_LENGTH - 1)
-    env = {"TASK_QUEUE_API_SECRET": short}
-    assert legacy_secret_configured(env) is False
-    assert legacy_secret_too_short(env) is True
-    assert authorize_client({LEGACY_SECRET_HEADER: short}, {}, env=env) is None
+def test_the_retired_header_is_logged_when_it_arrives_alone(caplog):
+    with caplog.at_level(logging.WARNING, logger="src.auth"):
+        assert authorize_client({RETIRED_SECRET_HEADER: RETIRED_SECRET}, {}) is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("retired" in m for m in messages)
+    assert not any(RETIRED_SECRET in m for m in messages)
 
 
-def test_a_legacy_secret_at_the_minimum_length_is_accepted():
-    ok = "x" * MIN_TOKEN_LENGTH
-    env = {"TASK_QUEUE_API_SECRET": ok}
-    assert legacy_secret_configured(env) is True
-    assert legacy_secret_too_short(env) is False
-    client = authorize_client({LEGACY_SECRET_HEADER: ok}, {}, env=env)
-    assert client is not None and client.channel == LEGACY_CHANNEL
-
-
-def test_a_non_ascii_legacy_header_is_refused_not_raised():
-    env = {"TASK_QUEUE_API_SECRET": LEGACY_SECRET}
-    assert authorize_client({LEGACY_SECRET_HEADER: "sécret"}, {}, env=env) is None
+def test_retired_secret_set_only_reports():
+    assert retired_secret_set({"TASK_QUEUE_API_SECRET": RETIRED_SECRET}) is True
+    assert retired_secret_set({}) is False
+    assert retired_secret_set({"TASK_QUEUE_API_SECRET": ""}) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -262,7 +254,7 @@ def test_a_non_ascii_legacy_header_is_refused_not_raised():
 
 @pytest.fixture
 def srv(tmp_path, monkeypatch):
-    """src.server with one agent token and the three test clients, legacy secret unset."""
+    """src.server with one agent token and the three test clients."""
     monkeypatch.setenv("TASK_QUEUE_TOKEN_DEVELOPER", AGENT_TOKEN)
     for key, value in CLIENT_ENV.items():
         monkeypatch.setenv(key, value)
@@ -625,29 +617,47 @@ def test_an_mcp_tool_write_records_no_channel(tmp_path, srv):
     assert "channel" not in _last_history(tmp_path, tid)
 
 
-# ── legacy shared secret (v0.11.0 only) ─────────────────────────────────
+# ── the retired shared secret (removed in v0.12.0) ──────────────────────
 
 
-def test_legacy_secret_is_refused_when_unset(tmp_path, http):
-    tid = _seed(tmp_path)[0]
-    resp = http.post(f"/tasks/{tid}/approve", headers={LEGACY_SECRET_HEADER: LEGACY_SECRET})
-    assert resp.status_code == 401
+def test_setting_the_retired_secret_again_re_enables_nothing(tmp_path, monkeypatch):
+    """
+    The plan's requirement for v0.12.0: TASK_QUEUE_API_SECRET, set again at startup, must
+    not open any route. Set before the reload, so it is in the environment the server
+    starts with, exactly as a restored env file would put it there.
+    """
+    monkeypatch.setenv("TASK_QUEUE_API_SECRET", RETIRED_SECRET)
+    for key, value in CLIENT_ENV.items():
+        monkeypatch.setenv(key, value)
+    import src.server as server
+
+    importlib.reload(server)
+    monkeypatch.setattr(server, "QUEUE_DIR", str(tmp_path))
+    try:
+        tid = _seed(tmp_path)[0]
+        with TestClient(server.mcp.http_app()) as c:
+            for method, path in _custom_routes(server):
+                resp = c.request(
+                    method,
+                    path.replace("{task_id}", tid),
+                    headers={RETIRED_SECRET_HEADER: RETIRED_SECRET},
+                    json={},
+                )
+                assert resp.status_code == 401, (method, path)
+        assert get_task_handler(task_id=tid, queue_dir=str(tmp_path))["status"] == "submitted"
+    finally:
+        monkeypatch.delenv("TASK_QUEUE_API_SECRET", raising=False)
+        for key in CLIENT_ENV:
+            monkeypatch.delenv(key, raising=False)
+        importlib.reload(server)
 
 
-def test_legacy_secret_works_when_set_and_logs_its_deprecation(tmp_path, http, monkeypatch, caplog):
-    monkeypatch.setenv("TASK_QUEUE_API_SECRET", LEGACY_SECRET)
-    tid = _seed(tmp_path)[0]
-    with caplog.at_level(logging.WARNING, logger="src.auth"):
-        resp = http.post(f"/tasks/{tid}/approve", headers={LEGACY_SECRET_HEADER: LEGACY_SECRET})
-    assert resp.status_code == 200
-    assert _last_history(tmp_path, tid)["channel"] == LEGACY_CHANNEL
-    assert any("deprecated shared secret" in r.getMessage() for r in caplog.records)
-    # The warning names the header and channel, never the value.
-    assert not any(LEGACY_SECRET in r.getMessage() for r in caplog.records)
-
-
-def test_legacy_secret_wrong_value_is_401(tmp_path, http, monkeypatch):
-    monkeypatch.setenv("TASK_QUEUE_API_SECRET", LEGACY_SECRET)
-    tid = _seed(tmp_path)[0]
-    resp = http.post(f"/tasks/{tid}/approve", headers={LEGACY_SECRET_HEADER: "wrong"})
-    assert resp.status_code == 401
+def test_the_retired_channel_name_stays_reserved():
+    """v0.11.0 history carries `channel: legacy-shared`; no client may take the name."""
+    assert RETIRED_CHANNEL == "legacy-shared"
+    env = {
+        "TASK_QUEUE_CLIENT_LEGACY_SHARED": token_digest(READ_TOKEN),
+        "TASK_QUEUE_CLIENT_SCOPES_LEGACY_SHARED": "read",
+    }
+    with pytest.raises(AuthConfigError, match="reserved"):
+        load_client_tokens(env=env)

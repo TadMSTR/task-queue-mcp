@@ -355,7 +355,7 @@ Give the first line to the client, in a file only it reads, and put the second i
 
 The server **refuses to start** on a malformed digest, a digest shared by two clients, a digest or scopes line without its partner, an empty or unknown scope, a channel named `operator` or `legacy-shared` or after an agent identity, or a client digest equal to an agent token's. Zero clients is valid: every custom route then refuses every request, and `/mcp` is unaffected.
 
-**Legacy shared secret (v0.11.0 only).** If `TASK_QUEUE_API_SECRET` is set, `X-Task-Queue-Secret` is still accepted as channel `legacy-shared` with both scopes, with a deprecation warning at startup and on every use. It exists only so the server can be deployed before its clients move. If `X-Task-Queue-Token` is present it decides the request alone, so a wrong token never falls back to the secret. **v0.12.0 removes it.**
+**The shared secret is gone (v0.12.0).** `TASK_QUEUE_API_SECRET` and the `X-Task-Queue-Secret` header grant nothing. If the variable is still set, the server logs a startup warning telling you to delete it. A request that sends only the old header gets a 401 and a log line naming it. v0.11.0 accepted the secret as channel `legacy-shared` while clients migrated. That name stays reserved, because history entries written then still carry it.
 
 ## Deployment
 
@@ -413,7 +413,7 @@ The container mounts only the task-queue directory read-write. The rest of the f
 | `MCP_PORT` | `8485` | Port for the HTTP server |
 | `TASK_QUEUE_CLIENT_<NAME>` | — | `sha256:<hex>` digest of one HTTP client's token, e.g. `TASK_QUEUE_CLIENT_CLOUDCLI`. Needs a matching `TASK_QUEUE_CLIENT_SCOPES_<NAME>`. See [Auth](#auth-per-client-scoped-tokens-since-v0110). |
 | `TASK_QUEUE_CLIENT_SCOPES_<NAME>` | — | Comma-separated scopes for that client: `read`, `operator-write`, or both. |
-| `TASK_QUEUE_API_SECRET` | — | **Deprecated; removed in v0.12.0.** The pre-v0.11.0 shared secret, still accepted as channel `legacy-shared` while clients migrate. |
+| `TASK_QUEUE_API_SECRET` | — | **Removed in v0.12.0.** Ignored; if set, the server warns at startup. |
 | `TASK_QUEUE_TOKEN_<AGENT>` | — | Bearer token for one calling agent, e.g. `TASK_QUEUE_TOKEN_DEVELOPER`. **At least one is required** — the HTTP transport refuses to start with none. The suffix becomes the agent identity, lowercased with `_` → `-` (`TASK_QUEUE_TOKEN_DOC_HEALTH` → `doc-health`). |
 
 Each agent needs its **own** token — the token is what identifies the caller, so sharing one

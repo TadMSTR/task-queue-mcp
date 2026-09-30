@@ -54,7 +54,8 @@ TOKEN_ENV_PREFIX = "TASK_QUEUE_TOKEN_"
 # `secrets.token_urlsafe(32)` (43 chars), so this only ever catches a misconfiguration.
 MIN_TOKEN_LENGTH = 16
 
-# "operator" is the identity the HTTP control routes assert, gated by TASK_QUEUE_API_SECRET.
+# "operator" is the identity the HTTP control routes assert, gated by a client token with the
+# operator-write scope.
 # It must never be reachable from the agent-facing MCP transport: the update_task ownership
 # check exempts it from every ownership rule, so a token minted for it would hand its holder
 # the whole queue. Refused at load time, not at call time — a misconfiguration should fail
@@ -266,16 +267,19 @@ VALID_SCOPES = frozenset({SCOPE_READ, SCOPE_OPERATOR_WRITE})
 DIGEST_PREFIX = "sha256:"
 _HEX = frozenset("0123456789abcdef")
 
-# v0.11.0 only. The shared secret still works under this channel so the server can deploy
-# before its clients move. v0.12.0 deletes it.
-LEGACY_SECRET_ENV = "TASK_QUEUE_API_SECRET"
-LEGACY_SECRET_HEADER = "X-Task-Queue-Secret"
-LEGACY_CHANNEL = "legacy-shared"
+# The pre-v0.11.0 shared secret, removed in v0.12.0. These names exist only so a leftover
+# setting or a stale client can be REPORTED. Nothing here honours them: setting the
+# variable again grants nothing, and the header is never read as a credential.
+RETIRED_SECRET_ENV = "TASK_QUEUE_API_SECRET"
+RETIRED_SECRET_HEADER = "X-Task-Queue-Secret"
+# v0.11.0 recorded shared-secret writes as `channel: legacy-shared`, and those history
+# entries still exist. The name stays reserved so no client can take it and make them
+# ambiguous.
+RETIRED_CHANNEL = "legacy-shared"
 
 # Channel names no client may take. `operator` is the actor every client writes as, and a
-# channel of that name would make the history entry say nothing. `legacy-shared` belongs to
-# the transitional shared-secret path.
-RESERVED_CHANNELS = frozenset({OPERATOR_ACTOR, LEGACY_CHANNEL})
+# channel of that name would make the history entry say nothing.
+RESERVED_CHANNELS = frozenset({OPERATOR_ACTOR, RETIRED_CHANNEL})
 
 
 @dataclass(frozen=True)
@@ -401,28 +405,15 @@ def load_client_tokens(
     return clients
 
 
-def legacy_secret_configured(env: dict[str, str] | None = None) -> bool:
-    """
-    Whether the legacy shared secret is set AND long enough to accept.
-
-    A secret shorter than MIN_TOKEN_LENGTH is treated as unset: it would otherwise grant
-    both scopes to anything that can guess it. The same floor applies to agent tokens.
-    """
+def retired_secret_set(env: dict[str, str] | None = None) -> bool:
+    """Whether the removed TASK_QUEUE_API_SECRET is still set. Only ever reported."""
     env = os.environ if env is None else env
-    return len(env.get(LEGACY_SECRET_ENV, "")) >= MIN_TOKEN_LENGTH
-
-
-def legacy_secret_too_short(env: dict[str, str] | None = None) -> bool:
-    """Set, but refused for being under MIN_TOKEN_LENGTH. For the startup warning."""
-    env = os.environ if env is None else env
-    value = env.get(LEGACY_SECRET_ENV, "")
-    return bool(value) and len(value) < MIN_TOKEN_LENGTH
+    return bool(env.get(RETIRED_SECRET_ENV, ""))
 
 
 def authorize_client(
     headers: Mapping[str, str],
     clients: dict[str, Client],
-    env: dict[str, str] | None = None,
 ) -> Client | None:
     """
     The client a custom-route request authenticates as, or None.
@@ -436,34 +427,25 @@ def authorize_client(
     hmac.compare_digest, without stopping at a match, so the time taken does not depend on
     which client matched or how far down the list it was.
 
-    If X-Task-Queue-Token is present it decides the outcome alone; the legacy header is only
-    consulted when it is absent, so a bad new token cannot fall back to the old secret.
+    The retired shared-secret header is never a credential. A request that sends it
+    without a client token is logged, so a client that was never moved is visible in the
+    log rather than only as a 401 on the far side.
     """
     presented = headers.get(CLIENT_TOKEN_HEADER)
-    if presented is not None:
-        if not presented:
-            return None
-        digest = token_digest(presented).encode("utf-8")
-        found: Client | None = None
-        for configured, client in clients.items():
-            if hmac.compare_digest(digest, configured.encode("utf-8")):
-                found = client
-        return found
-
-    env = os.environ if env is None else env
-    provided = headers.get(LEGACY_SECRET_HEADER)
-    if provided is None or not legacy_secret_configured(env):
+    if presented is None:
+        if headers.get(RETIRED_SECRET_HEADER) is not None:
+            logger.warning(
+                "control-api: request sent the retired %s and no %s; refused. "
+                "The shared secret was removed in v0.12.0.",
+                RETIRED_SECRET_HEADER,
+                CLIENT_TOKEN_HEADER,
+            )
         return None
-    secret = env[LEGACY_SECRET_ENV]
-    # Bytes, not str: compare_digest raises TypeError on non-ASCII str operands, and a
-    # malformed header must not escape as a 500. (audit L-02)
-    if not hmac.compare_digest(provided.encode("utf-8"), secret.encode("utf-8")):
+    if not presented:
         return None
-    logger.warning(
-        "control-api: request authenticated with the deprecated shared secret "
-        "(%s, channel %s). Move this client to %s; v0.12.0 removes the shared secret.",
-        LEGACY_SECRET_HEADER,
-        LEGACY_CHANNEL,
-        CLIENT_TOKEN_HEADER,
-    )
-    return Client(channel=LEGACY_CHANNEL, scopes=VALID_SCOPES)
+    digest = token_digest(presented).encode("utf-8")
+    found: Client | None = None
+    for configured, client in clients.items():
+        if hmac.compare_digest(digest, configured.encode("utf-8")):
+            found = client
+    return found
