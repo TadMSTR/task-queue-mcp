@@ -4,6 +4,60 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-30
+
+Fast read path, non-blocking HTTP routes, and a published image. Build
+`task-queue-read-perf-2026-09-p1-api-read-path`; vikunja#1003, absorbs vikunja#362's
+labels-and-tagged-image items.
+
+Since CloudCLI plugin v0.11.0 moved its reads onto this API, the Task Queue tab has made
+three to five of these calls per click. Timings are medians of 5 warm requests, v0.12.0's
+deployed image against this release's image, both run with forge's container flags
+against the same copy of forge's live queue (504 active, 1043 archive, 17 dead letters):
+
+| Route | v0.12.0 | v0.13.0 |
+|---|---|---|
+| `GET /tasks?limit=1000` | 1.24 s | 0.10 s |
+| `GET /tasks?status=failed&include_dead_letters=true&limit=1000` | 1.25 s | 0.10 s |
+| `GET /tasks/{id}`, a record in `archive/` | 3.23 s | 0.0014 s |
+| `GET /tasks/{id}`, the misnamed archive record (full-scan fallback) | 3.18 s | 0.28 s |
+| `GET /queue/summary` | 1.18 s | 0.10 s |
+
+### Changed
+- **Task files are parsed with libyaml's `CSafeLoader`.** `yaml.safe_load` always used the
+  pure-Python `SafeLoader`, even when libyaml was installed. The two loaders produced
+  identical output for every file in the live queue. If PyYAML lacks libyaml, the server
+  falls back to `SafeLoader`, and the startup log names the loader in use.
+- **Looking up one task no longer parses the whole archive.** `get_task`, `update_task`,
+  `set_task_status` (and so park and cancel), `unpark_task`, `amend_task`, the submit-time
+  auto-close and the dead-letter lookup first parse only the files named
+  `*-<id[:8]>.yml` and compare the full id. On a miss they fall back to the full scan, so
+  a record whose filename does not match its id is still found. The live archive holds
+  one (`20260603-121702-856b868d.yml` is id `741bf127-…`), and each fallback hit logs a
+  warning naming the file. Each call site keeps its directory set: mutations still never
+  read `dead-letters/`.
+- **HTTP routes run their handlers on worker threads**, as FastMCP already does for every
+  MCP tool. Before this, one slow scan blocked the event loop and every other HTTP caller
+  waited behind it. Mutations stay serialised per task by the existing `fcntl` lock, and a
+  new test races two mutations through the ASGI app to check it. A control test removes the
+  lock and requires the race to corrupt the record, which proves the two requests really
+  overlap.
+
+### Added
+- **Published image** `ghcr.io/tadmstr/task-queue-mcp`, built on every `v*` tag in
+  `release.yml`. The job builds once, smoke-tests that exact image, then pushes `vX.Y.Z`
+  and `X.Y.Z`; `X.Y` and `latest` move only for non-prereleases. It then attests build
+  provenance and verifies the attestation in the same job, because forge's `gh` cannot
+  (vikunja#1004). The GitHub Release is cut after the image is published and names the
+  pushed digest. The workflow also refuses a tag that does not match `pyproject.toml`.
+- **CI builds and smoke-tests the image** on every push and PR (`docker` job). It checks
+  that libyaml is present, runs the image with forge's read-only, cap-dropped, UID-1000
+  flags, and checks the token gate plus a real list, get and summary against a seeded task.
+- **OCI labels**: `org.opencontainers.image.source`, `.version` and `.revision`
+  (vikunja#362). A local build reports `dev` and `unknown`.
+
+No MCP tool signature or output schema changed, and no new environment variables.
+
 ## [0.12.0] - 2026-09-29
 
 Remove the shared secret. Build `operator-panel-2026-09-p2-queue-read-api` Phase 5;

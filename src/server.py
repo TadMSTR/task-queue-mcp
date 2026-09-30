@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 import os
@@ -5,6 +6,7 @@ import sys
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 
+import anyio.to_thread
 from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import Response
@@ -29,6 +31,7 @@ from src.tools.queue import (
     NON_TERMINAL_STATUSES,
     OPERATOR_ACTOR,
     VALID_STATUSES,
+    YAML_LOADER_NAME,
     _load_all_tasks,
     amend_task_handler,
     cancel_task_handler,
@@ -63,6 +66,9 @@ async def lifespan(app):
         )
         sys.exit(1)
     logger.info("task-queue-mcp started. Queue dir: %s", QUEUE_DIR)
+    # Named at startup so a slow deployment can be diagnosed from its log: SafeLoader here
+    # means PyYAML lost libyaml, and every read is ~10x slower (vikunja#1003).
+    logger.info("YAML loader: %s", YAML_LOADER_NAME)
     yield
     logger.info("task-queue-mcp shutting down.")
 
@@ -421,7 +427,7 @@ ROUTE_SCOPES: dict[tuple[str, str], str] = {}
 
 
 def _json_default(value):
-    # yaml.safe_load produces datetimes and dates for timestamp fields. The MCP transport
+    # The YAML loader produces datetimes and dates for timestamp fields. The MCP transport
     # serialises them as ISO 8601 through pydantic, and the HTTP routes must match it.
     if isinstance(value, datetime | date):
         return value.isoformat()
@@ -477,6 +483,23 @@ def _control_route(path: str, method: str, scope: str):
     return register
 
 
+async def _offload(fn, /, **kwargs):
+    """
+    Run a blocking queue handler on a worker thread and await its result.
+
+    Every handler parses YAML from disk. Called directly from these `async def` routes, one
+    slow scan held the event loop and every other HTTP caller waited behind it. FastMCP
+    already runs each sync `@mcp.tool` this way (anyio.to_thread.run_sync), so the MCP path
+    and the HTTP path now share one concurrency model. Mutations are safe off the loop for
+    the reason MCP tool calls already were: _task_lock is fcntl.flock on a freshly opened
+    file, and flock locks belong to the open file description, so two threads in this
+    process exclude each other (test_control_api's concurrency tests prove it).
+
+    Only the handler call moves. Auth and body parsing stay on the loop.
+    """
+    return await anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+
+
 async def _json_body(request: Request) -> dict:
     """Parse a JSON request body, tolerating an empty body. Returns {} on empty/invalid."""
     raw = await request.body()
@@ -507,7 +530,8 @@ def _control_response(result: dict) -> Response:
 @_control_route("/tasks/{task_id}/approve", "POST", SCOPE_OPERATOR_WRITE)
 async def http_approve(request: Request, client: Client) -> Response:
     body = await _json_body(request)
-    result = set_task_status_handler(
+    result = await _offload(
+        set_task_status_handler,
         task_id=request.path_params["task_id"],
         status="approved",
         actor=OPERATOR_ACTOR,
@@ -521,7 +545,8 @@ async def http_approve(request: Request, client: Client) -> Response:
 @_control_route("/tasks/{task_id}/cancel", "POST", SCOPE_OPERATOR_WRITE)
 async def http_cancel(request: Request, client: Client) -> Response:
     body = await _json_body(request)
-    result = cancel_task_handler(
+    result = await _offload(
+        cancel_task_handler,
         task_id=request.path_params["task_id"],
         actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
@@ -534,7 +559,8 @@ async def http_cancel(request: Request, client: Client) -> Response:
 @_control_route("/tasks/{task_id}/status", "POST", SCOPE_OPERATOR_WRITE)
 async def http_set_status(request: Request, client: Client) -> Response:
     body = await _json_body(request)
-    result = set_task_status_handler(
+    result = await _offload(
+        set_task_status_handler,
         task_id=request.path_params["task_id"],
         status=body.get("status", ""),
         actor=OPERATOR_ACTOR,
@@ -549,7 +575,8 @@ async def http_set_status(request: Request, client: Client) -> Response:
 @_control_route("/tasks/{task_id}/park", "POST", SCOPE_OPERATOR_WRITE)
 async def http_park(request: Request, client: Client) -> Response:
     body = await _json_body(request)
-    result = park_task_handler(
+    result = await _offload(
+        park_task_handler,
         task_id=request.path_params["task_id"],
         actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
@@ -562,7 +589,8 @@ async def http_park(request: Request, client: Client) -> Response:
 @_control_route("/tasks/{task_id}/unpark", "POST", SCOPE_OPERATOR_WRITE)
 async def http_unpark(request: Request, client: Client) -> Response:
     body = await _json_body(request)
-    result = unpark_task_handler(
+    result = await _offload(
+        unpark_task_handler,
         task_id=request.path_params["task_id"],
         actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
@@ -576,7 +604,8 @@ async def http_unpark(request: Request, client: Client) -> Response:
 @_control_route("/tasks/{task_id}/amend", "POST", SCOPE_OPERATOR_WRITE)
 async def http_amend(request: Request, client: Client) -> Response:
     body = await _json_body(request)
-    result = amend_task_handler(
+    result = await _offload(
+        amend_task_handler,
         task_id=request.path_params["task_id"],
         amendment=body.get("amendment", ""),
         actor=OPERATOR_ACTOR,
@@ -606,7 +635,8 @@ async def http_update(request: Request, client: Client) -> Response:
     years later, not as the agent having quietly closed its own work.
     """
     body = await _json_body(request)
-    result = update_task_handler(
+    result = await _offload(
+        update_task_handler,
         task_id=request.path_params["task_id"],
         status=body.get("status", ""),
         actor=OPERATOR_ACTOR,
@@ -628,7 +658,8 @@ async def http_requeue(request: Request, client: Client) -> Response:
     assertable and nowhere else.
     """
     body = await _json_body(request)
-    result = requeue_dead_letter_handler(
+    result = await _offload(
+        requeue_dead_letter_handler,
         task_id=request.path_params["task_id"],
         actor=OPERATOR_ACTOR,
         note=body.get("note", ""),
@@ -706,7 +737,8 @@ async def http_list_tasks(request: Request, client: Client) -> Response:
             status_code=400,
         )
     try:
-        page = list_tasks_page_handler(
+        page = await _offload(
+            list_tasks_page_handler,
             target_agent=params.get("target_agent") or None,
             source_agent=params.get("source_agent") or None,
             status=params.get("status") or None,
@@ -729,7 +761,9 @@ async def http_get_task(request: Request, client: Client) -> Response:
     get_task over HTTP: searches the queue, archive/ and dead-letters/. Returns
     {ok, task}; 400 on a malformed id, 404 when no record has it.
     """
-    result = get_task_handler(task_id=request.path_params["task_id"], queue_dir=QUEUE_DIR)
+    result = await _offload(
+        get_task_handler, task_id=request.path_params["task_id"], queue_dir=QUEUE_DIR
+    )
     if result.get("ok") is False:
         return _control_response(result)
     return _json({"ok": True, "task": result})
@@ -748,9 +782,14 @@ async def http_queue_summary(request: Request, client: Client) -> Response:
     interface for three months. `counts`, `active` and `total` all describe the ACTIVE
     queue only; `dead_letters` is the number of records the dispatcher gave up on.
     """
+    return _json(await _offload(_queue_summary, queue_dir=QUEUE_DIR))
+
+
+def _queue_summary(queue_dir: str) -> dict:
+    """http_queue_summary's body: blocking disk reads, so it runs on a worker thread."""
     counts: dict[str, int] = {}
     unknown = 0
-    for task in _load_all_tasks(QUEUE_DIR):
+    for task in _load_all_tasks(queue_dir):
         status = task.get("status")
         if status in VALID_STATUSES:
             counts[status] = counts.get(status, 0) + 1
@@ -760,15 +799,13 @@ async def http_queue_summary(request: Request, client: Client) -> Response:
         counts["unknown"] = unknown
 
     active = sum(n for s, n in counts.items() if s in NON_TERMINAL_STATUSES)
-    return _json(
-        {
-            "ok": True,
-            "counts": counts,
-            "active": active,
-            "total": sum(counts.values()),
-            "dead_letters": count_dead_letters(QUEUE_DIR),
-        }
-    )
+    return {
+        "ok": True,
+        "counts": counts,
+        "active": active,
+        "total": sum(counts.values()),
+        "dead_letters": count_dead_letters(queue_dir),
+    }
 
 
 if __name__ == "__main__":

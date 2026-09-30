@@ -297,6 +297,15 @@ An unknown status, an unknown query parameter (a misspelt filter would otherwise
 
 `GET /tasks/{id}` returns `{"ok": true, "task": {...}}`, `400` on a malformed id, `404` when no record has it. Timestamps are ISO 8601 strings, as on the MCP transport.
 
+**Read performance (since v0.13.0).** Task files are parsed with libyaml's `CSafeLoader`
+(the startup log names the loader in use). A lookup by id, for `get_task` and every
+mutation, parses only the files named `*-<id[:8]>.yml`. If none of those holds the id, it
+falls back to a full scan and logs a warning naming the misnamed file. So a record whose
+filename does not match its id is still found, never reported as `404`. Every HTTP route runs
+its handler on a worker thread, as FastMCP already does for MCP tools, so a slow scan no
+longer holds up other callers. Concurrent writes to one task are still serialised by its
+`fcntl` lock.
+
 ### The operator sweep — `POST /tasks/{id}/update`
 
 The only path to a terminal transition on **another agent's** task. It exists because v0.8.0 closed the dishonest version: agents used to tidy up a stranded task by passing that agent's name as `actor`, which binding `actor` to a bearer token removes. Nothing else reaches it — `set_task_status` cannot make terminal transitions and the `update_task` *tool* now demands the resolved identity — so without this every stray would need the operator to intervene by hand.
@@ -361,10 +370,21 @@ The server **refuses to start** on a malformed digest, a digest shared by two cl
 
 ### Docker (production)
 
+Since v0.13.0 every release tag publishes an image to GHCR:
+`ghcr.io/tadmstr/task-queue-mcp`, tagged `vX.Y.Z` and `X.Y.Z`, with `X.Y` and `latest`
+moving only for non-prerelease tags. linux/amd64 only. Each image is smoke-tested before it
+is pushed (libyaml present, the hardened flags below, token gate, UID 1000), and it carries
+build provenance that the publishing run verifies (`gh attestation verify`) before it
+finishes.
+
+**Pin the tag and the digest.** The digest is in the GitHub Release notes for that tag and
+in the publishing run's summary. A pull that resolves to a different digest is not the
+image that was tested and verified.
+
 ```yaml
 services:
   task-queue-mcp:
-    image: task-queue-mcp:latest
+    image: ghcr.io/tadmstr/task-queue-mcp:v0.13.0@sha256:<digest from the Release notes>
     container_name: task-queue-mcp
     ports:
       # The loopback bind is load-bearing, not cosmetic. The MCP transport on this port
@@ -390,6 +410,11 @@ services:
 ```
 
 The container mounts only the task-queue directory read-write. The rest of the filesystem is read-only. `/tmp` is a tmpfs for transient scratch space.
+
+`docker inspect` reports what is running: `org.opencontainers.image.version` and
+`.revision` are set to the release tag and commit. A locally built image reports `dev` and
+`unknown`. To run from source instead, replace `image:` with `build: <path to this repo>`
+(see [Building](#building)).
 
 ### Claude Code settings.json
 
@@ -436,7 +461,13 @@ headers:
 
 ```bash
 docker build -t task-queue-mcp:latest .
+
+# Optional: label the build the way the release workflow does.
+docker build --build-arg VERSION=0.13.0 --build-arg REVISION="$(git rev-parse HEAD)" \
+  -t task-queue-mcp:0.13.0 .
 ```
+
+CI builds the image on every push and PR, and runs the same smoke test as the publish job.
 
 ## Development
 

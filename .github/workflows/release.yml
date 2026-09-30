@@ -5,31 +5,296 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write # Required for gh release create
+env:
+  IMAGE: ghcr.io/tadmstr/task-queue-mcp
 
-# Source-only release (no PyPI) — same pattern as matrix-dispatcher/agent-bus/dockhand-mcp/githost-mcp.
-# A tag `vX.Y.Z` cuts a GitHub Release with auto-generated notes.
+# Least privilege by default; each job declares what it needs next to the step that uses it.
+permissions:
+  contents: read
+
+# One tag produces both artefacts, and they cannot drift apart: the image is published
+# first, and the GitHub Release is cut only after it, carrying the pushed digest in its
+# notes. A single file rather than a separate docker-publish.yml because of vikunja#789,
+# a release workflow that published an image and never cut the Release (see also #828).
+# With `needs:`, a missing Release is a red job on the same run, not an absence nobody
+# notices.
 jobs:
+  publish-image:
+    name: Build, smoke test, publish image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      CONTAINER: tq-publish
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # The tag must name the version the package declares. A mismatch would publish an
+      # image whose label, tag and pyproject disagree about what it is.
+      - name: Tag matches pyproject version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          declared=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "tag ${REF_NAME}, pyproject ${declared}"
+          [ "${REF_NAME#v}" = "$declared" ]
+
+      # linux/amd64 only: forge is the one consumer. Built with plain docker and loaded
+      # into the local daemon, so the smoke test runs against the exact image this job
+      # pushes. Never rebuild to push.
+      - name: Build image
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          docker build \
+            --build-arg VERSION="${REF_NAME#v}" \
+            --build-arg REVISION="$GITHUB_SHA" \
+            -t "$IMAGE:candidate" .
+
+      - name: Image labels name this release
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          label() { docker inspect --format "{{index .Config.Labels \"$1\"}}" "$IMAGE:candidate"; }
+          echo "version=$(label org.opencontainers.image.version) revision=$(label org.opencontainers.image.revision)"
+          [ "$(label org.opencontainers.image.version)" = "${REF_NAME#v}" ]
+          [ "$(label org.opencontainers.image.revision)" = "$GITHUB_SHA" ]
+
+      # The gate. Identical assertions to ci.yml's docker job, run on this image before
+      # anything is pushed: CI being green on some earlier commit is not the same claim.
+      - name: Smoke test the image
+        env:
+          IMAGE: ${{ env.IMAGE }}:candidate
+        run: |
+          set -euo pipefail
+
+          # The assertion this image exists to keep true. `yaml.safe_load` never used
+          # libyaml, and a base-image or PyYAML change that dropped it would silently
+          # bring back ~2.7 s single-task lookups (vikunja#1003).
+          docker run --rm --entrypoint python "$IMAGE" -c \
+            "import yaml; assert yaml.__with_libyaml__, 'PyYAML built without libyaml'; yaml.CSafeLoader; print('libyaml OK, PyYAML', yaml.__version__)"
+
+          # Throwaway credentials, generated here and passed by name (`-e VAR`), so no
+          # value reaches the docker argv. The server refuses to start with no agent
+          # token; the client token is what the HTTP read routes accept.
+          TASK_QUEUE_TOKEN_CITEST=$(openssl rand -hex 32)
+          CLIENT_TOKEN=$(openssl rand -hex 32)
+          TASK_QUEUE_CLIENT_PROBE="sha256:$(printf '%s' "$CLIENT_TOKEN" | sha256sum | cut -d' ' -f1)"
+          TASK_QUEUE_CLIENT_SCOPES_PROBE="read"
+          export TASK_QUEUE_TOKEN_CITEST TASK_QUEUE_CLIENT_PROBE TASK_QUEUE_CLIENT_SCOPES_PROBE
+
+          # One real record, so the reads below parse YAML inside the image rather than
+          # answer from an empty directory. 0777 because the container is UID 1000 and
+          # the runner is not.
+          QDIR=$(mktemp -d)
+          chmod 0777 "$QDIR"
+          TID=0badc0de-0000-4000-8000-000000000001
+          cat > "$QDIR/20260930-000000-0badc0de.yml" <<YAML
+          id: $TID
+          created: 2026-09-30T00:00:00Z
+          source_agent: ci
+          target_agent: developer
+          task_type: build
+          status: submitted
+          summary: smoke — ✓
+          payload: {description: "multi\nline"}
+          history:
+            - {timestamp: '2026-09-30T00:00:00Z', status: submitted, actor: ci}
+          YAML
+
+          # The flags forge runs it with.
+          docker run -d --name "$CONTAINER" -p 127.0.0.1:8485:8485 \
+            --read-only --tmpfs /tmp --user 1000:1000 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -v "$QDIR:/task-queue" -e TASK_QUEUE_DIR=/task-queue \
+            -e TASK_QUEUE_TOKEN_CITEST -e TASK_QUEUE_CLIENT_PROBE -e TASK_QUEUE_CLIENT_SCOPES_PROBE \
+            "$IMAGE"
+
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+          URL=http://127.0.0.1:8485
+
+          for i in $(seq 1 30); do
+            unauth=$(code "$URL/tasks" || true)
+            [ "$unauth" = 401 ] && break
+            if [ "$i" = 30 ]; then echo "server never came up"; exit 1; fi
+            sleep 1
+          done
+          echo "GET /tasks (no token) -> $unauth"
+
+          wrong=$(code -H 'X-Task-Queue-Token: not-the-token' "$URL/tasks")
+          echo "GET /tasks (wrong token) -> $wrong"
+          [ "$wrong" = 401 ]
+
+          AUTH="X-Task-Queue-Token: $CLIENT_TOKEN"
+          body=$(curl -sf -H "$AUTH" "$URL/tasks")
+          echo "GET /tasks (client token) -> $body"
+          printf '%s' "$body" | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d['ok'] is True and d['count'] == 1, d
+          assert d['tasks'][0]['id'] == '$TID' and d['tasks'][0]['summary'] == 'smoke — ✓', d
+          "
+
+          got=$(code -H "$AUTH" "$URL/tasks/$TID")
+          echo "GET /tasks/<id> -> $got"
+          [ "$got" = 200 ]
+
+          missing=$(code -H "$AUTH" "$URL/tasks/0badc0de-0000-4000-8000-000000000002")
+          echo "GET /tasks/<absent id> -> $missing"
+          [ "$missing" = 404 ]
+
+          summary=$(code -H "$AUTH" "$URL/queue/summary")
+          echo "GET /queue/summary -> $summary"
+          [ "$summary" = 200 ]
+
+          docker logs "$CONTAINER" 2>&1 | grep -q 'YAML loader: CSafeLoader' \
+            || { echo "startup log does not name CSafeLoader"; exit 1; }
+          echo "startup log names CSafeLoader"
+
+          uid=$(docker exec "$CONTAINER" id -u)
+          echo "runtime uid -> $uid"
+          [ "$uid" = 1000 ]
+
+      - name: Container logs
+        if: always()
+        run: docker logs "$CONTAINER" || true
+
+      # Token through `env`, never `${{ }}` in the script body, and --password-stdin so
+      # it is not in the process table either.
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" \
+            | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      # Both `v0.13.0` and `0.13.0`: the git tag carries the `v` and the Docker convention
+      # does not, and publishing only one leaves a documented tag that does not exist.
+      # The floating tags (`0.13`, `latest`) move only for a plain release, never an rc.
+      - name: Tag and push
+        id: push
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          V="${REF_NAME#v}"
+          MINOR="$(echo "$V" | cut -d. -f1,2)"
+
+          TAGS=("$REF_NAME" "$V")
+          case "$V" in
+            *-*) echo "prerelease $V: publishing exact tags only, not :$MINOR or :latest" ;;
+            *)   TAGS+=("$MINOR" "latest") ;;
+          esac
+
+          for t in "${TAGS[@]}"; do
+            echo "pushing $IMAGE:$t"
+            docker tag "$IMAGE:candidate" "$IMAGE:$t"
+            docker push "$IMAGE:$t"
+          done
+
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$V" | cut -d@ -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "pushed digest $DIGEST"
+
+      # `push-to-registry: true` works. GHCR does not serve the OCI referrers API and
+      # answers 404 there even for an attested digest; it publishes the referrers index
+      # under the fallback tag `sha256-<digest>` instead. Do not remove this line over a
+      # referrers 404 (vikunja#689, vikunja#699).
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # The only place provenance can be checked. Forge's gh is Debian 2.46.0, which has
+      # no `attestation` command (vikunja#1004), so a deployer cannot run this. The job
+      # fails if the attestation it just made does not verify against this repository.
+      - name: Verify the attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GITHUB_REPOSITORY"
+
+      # The digest is how a deployer ties the image it pulls to the one verified above.
+      - name: Record the digest
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### Published image"
+            echo
+            echo "\`$IMAGE:$REF_NAME@$DIGEST\`"
+            echo
+            echo "Provenance attested and verified in this job (\`gh attestation verify\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   create-github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    needs: publish-image
+    permissions:
+      contents: write # gh release create / edit
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
 
-      - name: Create GitHub Release (source only)
+      # Source release with auto-generated notes, then the image and digest prepended. The
+      # two steps are separate on purpose: create only if absent, then add the image block
+      # only if the digest is not already there. A re-run therefore neither duplicates the
+      # Release (vikunja#424) nor the block, and nothing depends on how a given gh version
+      # combines --notes-file with --generate-notes.
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          if gh release view "${TAG_NAME}" &>/dev/null; then
-            echo "Release ${TAG_NAME} already exists; nothing to do."
+          set -euo pipefail
+          if gh release view "$TAG_NAME" &>/dev/null; then
+            echo "Release $TAG_NAME already exists."
           else
-            gh release create "${TAG_NAME}" \
-              --title "${TAG_NAME}" \
-              --generate-notes \
-              --verify-tag
+            gh release create "$TAG_NAME" --title "$TAG_NAME" --generate-notes --verify-tag
           fi
+
+      - name: Add the image digest to the Release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          DIGEST: ${{ needs.publish-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [ -n "$DIGEST" ] || { echo "publish-image produced no digest"; exit 1; }
+          body=$(gh release view "$TAG_NAME" --json body -q .body)
+          if printf '%s' "$body" | grep -qF "$DIGEST"; then
+            echo "Release $TAG_NAME already names $DIGEST."
+            exit 0
+          fi
+          notes=$(mktemp)
+          {
+            echo "## Container image"
+            echo
+            echo '```'
+            echo "$IMAGE:$TAG_NAME@$DIGEST"
+            echo '```'
+            echo
+            echo "Build provenance is attested and was verified in the publishing run."
+            echo
+            printf '%s\n' "$body"
+          } > "$notes"
+          gh release edit "$TAG_NAME" --notes-file "$notes"
+          gh release view "$TAG_NAME" --json body -q .body | grep -qF "$DIGEST"

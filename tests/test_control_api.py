@@ -7,12 +7,18 @@ scope matrix and the route enumeration live in test_client_tokens.py.
 Exercised end-to-end via Starlette's TestClient against mcp.http_app().
 """
 
+import asyncio
+import contextlib
 import importlib
+import threading
+import time
 
+import httpx
 import pytest
 import yaml
 from starlette.testclient import TestClient
 
+import src.tools.queue as queue_module
 from src.auth import token_digest
 from src.tools.queue import get_task_handler, submit_task_handler, update_task_handler
 
@@ -564,3 +570,126 @@ def test_on_behalf_of_is_refused_for_a_non_operator_actor():
 
     assert r["ok"] is False
     assert "reserved for the 'operator' actor" in r["error"]
+
+
+# ── concurrency: the routes run handlers on worker threads (vikunja#1003) ──
+#
+# Driven with asyncio.run over httpx.ASGITransport, not an async test: this repo has no
+# async pytest plugin, by design (see test_auth.py). ASGITransport does not run the app's
+# lifespan, unlike TestClient. That is fine here: src.server's lifespan only checks the
+# queue dir and logs, and FastMCP's own lifespan starts the MCP session manager, which the
+# custom routes do not use.
+
+
+def _gather(app, *requests, raise_app_exceptions=True):
+    """Send (method, path) requests concurrently; return the responses in order."""
+
+    async def run():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=raise_app_exceptions)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            return await asyncio.gather(
+                *(c.request(method, path, headers=AUTH, json={}) for method, path in requests)
+            )
+
+    return asyncio.run(run())
+
+
+def _slow_writes(monkeypatch, seconds=0.3):
+    """Widen the read-modify-write window so two unserialised mutations always overlap."""
+    real = queue_module._write_task_atomic
+
+    def slow(path, data):
+        time.sleep(seconds)
+        real(path, data)
+
+    monkeypatch.setattr(queue_module, "_write_task_atomic", slow)
+
+
+def _race_park_and_cancel(srv, tmp_path, **gather_kw):
+    tid = _seed(tmp_path, status="approved")
+    before = len(get_task_handler(task_id=tid, queue_dir=str(tmp_path))["history"])
+    responses = _gather(
+        srv.mcp.http_app(),
+        ("POST", f"/tasks/{tid}/park"),
+        ("POST", f"/tasks/{tid}/cancel"),
+        **gather_kw,
+    )
+    # Re-parse from disk: a torn write would fail here, not in the handler.
+    task = get_task_handler(task_id=tid, queue_dir=str(tmp_path))
+    return task, before, [r.status_code for r in responses]
+
+
+def test_concurrent_mutations_on_one_task_serialise(env, monkeypatch):
+    """
+    park and cancel at once. Either order is valid (cancel wins outright, or park then
+    cancel), and both end `cancelled`. What must never happen is a lost update: both
+    reading `approved` and the second write discarding the first. Every success appends
+    exactly one history entry, so the count is the proof.
+    """
+    srv, tmp_path = env
+    _slow_writes(monkeypatch)
+
+    task, before, codes = _race_park_and_cancel(srv, tmp_path)
+    won = codes.count(200)
+
+    # The loser, if there is one, is refused a transition out of `cancelled`: a 400.
+    assert sorted(codes) in ([200, 200], [200, 400]), codes
+    assert task["status"] == "cancelled"
+    assert len(task["history"]) == before + won
+
+
+def test_concurrent_mutations_really_overlap_without_the_lock(env, monkeypatch):
+    """
+    The control for the test above. With _task_lock removed the same race MUST go wrong:
+    either an update is lost (both succeed, one history entry lands) or the two writers
+    collide on the shared `.tmp` path and one of them fails with a 500. If neither happens,
+    the requests never ran concurrently, and the test above passes for a reason that has
+    nothing to do with the lock.
+    """
+    srv, tmp_path = env
+    _slow_writes(monkeypatch)
+    monkeypatch.setattr(queue_module, "_task_lock", lambda *_: contextlib.nullcontext())
+
+    task, before, codes = _race_park_and_cancel(srv, tmp_path, raise_app_exceptions=False)
+
+    lost_update = codes == [200, 200] and len(task["history"]) == before + 1
+    torn_write = 500 in codes
+    assert lost_update or torn_write, f"no race observed: {codes}, the requests did not overlap"
+
+
+def test_a_slow_list_does_not_block_other_requests(env, monkeypatch):
+    """
+    GET /tasks is held inside its handler until GET /queue/summary has answered. On the
+    event loop, the summary could not even start until the list gave up, and the list
+    would see its wait time out.
+    """
+    srv, tmp_path = env
+    _seed(tmp_path)
+    summary_done = threading.Event()
+    released = []
+
+    def held_list(**kwargs):
+        released.append(summary_done.wait(timeout=5))
+        return {"tasks": [], "count": 0, "truncated": False}
+
+    monkeypatch.setattr(srv, "list_tasks_page_handler", held_list)
+    app = srv.mcp.http_app()
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+
+            async def summary():
+                await asyncio.sleep(0.05)  # let the list request reach its handler first
+                r = await c.get("/queue/summary", headers=AUTH)
+                summary_done.set()
+                return r
+
+            return await asyncio.gather(c.get("/tasks", headers=AUTH), summary())
+
+    listed, summary = asyncio.run(run())
+
+    assert summary.status_code == 200
+    assert summary.json()["total"] == 1
+    assert listed.status_code == 200
+    assert released == [True], "the summary only ran after the list's handler timed out"
