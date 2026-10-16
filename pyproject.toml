@@ -1,6 +1,6 @@
 [project]
 name = "task-queue-mcp"
-version = "0.13.0"
+version = "0.14.0"
 description = "FastMCP server exposing the agent orchestration task queue as MCP tools"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,7 +9,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff==0.16.0"]
+# agent-bus is a TEST-ONLY dependency: tests/test_events.py runs every event file this
+# server writes through agent-bus's own outbox validator, which is the gate on the file
+# contract. The server never imports it. Pinned by SHA (tags are mutable); keep the version
+# named here in step: agent-bus v0.5.0.
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff==0.16.0",
+    "agent-bus @ git+https://github.com/TadMSTR/agent-bus@bc0d21b5fae576f45de97f0ab02c3d4ae870791a",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -45,6 +45,8 @@ submit_task(
     ttl_days=30,
     workflow_mode="semi-auto",  # semi-auto | auto | manual-then-auto (default: semi-auto)
     originating_task_id=None,  # UUID of the parent task, if this is a return task
+    build_name=None,  # optional: the build this task belongs to ([A-Za-z0-9_-], ≤128)
+    audit_round=None,  # optional, 1-20, audit / ticket_audit only
 )
 # → {"ok": true, "task_id": "<uuid>", "filename": "<timestamp>-<slug>.yml"}
 ```
@@ -247,6 +249,40 @@ that submits a request cannot close it, because the request targets someone else
 pair therefore needs the *receiving* agent to claim and close its own entry — two calls, since
 `completed` is only reachable from `in-progress`. The [auto-close](#auto-close-of-the-originating-task-since-v060)
 is the fail-safe for when it doesn't, not a substitute for it.
+
+## Lifecycle events (since v0.14.0)
+
+This server writes every task transition, so it is the component that reports each one to
+agent-bus. After the write succeeds, still inside the per-task lock, it writes one JSON file
+into `<queue>/.outbox/`. agent-bus drains that directory into its chained log; the file
+format is agent-bus's outbox contract (its README, "Producer Outboxes").
+
+| Transition | Event |
+|---|---|
+| submit | `task.submitted` (a `notify` task also gets `task.completed`) |
+| → approved | `task.approved` |
+| → pending-approval | `task.pending-approval` |
+| → in-progress | `task.started` |
+| → completed / failed / cancelled | `task.completed` / `task.failed` / `task.cancelled` |
+| → parked | `task.parked` |
+| parked → any non-terminal | `task.unparked` |
+| amend | `task.amended` |
+| requeue from dead letters, or an override back to `submitted` | `task.requeued` |
+| → routing-failed (operator override) | `task.routing-failed` |
+
+Metadata: `task_id`, `from_status`, `to_status`, `actor`, `channel`, `on_behalf_of`,
+`source_agent`, `target_agent`, `task_type`, `workflow_mode`, `build_name`, `audit_round`,
+`schema`; keys with no value are omitted. The event summary is the task summary cut to 200
+characters. **`payload.description`, amendment text and result output are never in an event.**
+
+- **A lost event never blocks a queue write.** If the outbox cannot be written, the error is
+  logged and the transition stands. A crash between the task write and the event write loses
+  that event; it never produces an event for a write that did not happen.
+- **The outbox is invisible to queue readers.** Every reader globs top-level `*.yml`, so a
+  dot-directory is skipped, as `.locks/` already is.
+- **Bus events are display-only.** Do not approve, launch or grant anything from one.
+- Writes that bypass this server (the dispatcher writing YAML directly) are reported by the
+  dispatcher itself, through agent-bus's client.
 
 ## HTTP Control and Read API
 
@@ -526,7 +562,7 @@ This covers `source_agent` on `submit_task` too, which is an identity claim and 
 
 ## Task File Schema
 
-Tasks are YAML files in `~/.claude/task-queue/`, named `YYYYMMDD-HHMMSS-<uuid-prefix>.yml`. All writes are atomic (write to `.tmp`, then `os.rename()`). Per-task file locks via `fcntl.flock` prevent races between concurrent MCP calls and the dispatcher.
+Tasks are YAML files in `~/.claude/task-queue/`, named `YYYYMMDD-HHMMSS-<uuid-prefix>.yml`. Two optional top-level fields were added in v0.14.0: `build_name` and `audit_round` (see `submit_task`). Records without them are unchanged. All writes are atomic (write to `.tmp`, then `os.rename()`). Per-task file locks via `fcntl.flock` prevent races between concurrent MCP calls and the dispatcher.
 
 For the full schema and lifecycle documentation, see the [homelab-agent component doc](https://github.com/TadMSTR/homelab-agent/blob/main/docs/components/agent/task-queue-mcp.md).
 
