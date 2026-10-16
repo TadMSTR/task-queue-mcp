@@ -38,8 +38,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,26 @@ _BY_TARGET = {
     "failed": "task.failed",
     "cancelled": "task.cancelled",
 }
+
+# agent-bus drains in file-name order, and the name starts with the timestamp. Two events
+# written in the same microsecond (a notify's submitted + completed, or any two writes on
+# worker threads) would otherwise sort by their random uuid, not by the order they
+# happened. So each process hands out strictly increasing stamps: never earlier than the
+# last one, one microsecond later when the clock has not moved. Ordering across processes
+# is by the clock, which is all a separate process can promise.
+_stamp_lock = threading.Lock()
+_last_stamp: datetime | None = None
+
+
+def _next_stamp() -> datetime:
+    global _last_stamp
+    with _stamp_lock:
+        now = datetime.now(UTC)
+        if _last_stamp is not None and now <= _last_stamp:
+            now = _last_stamp + timedelta(microseconds=1)
+        _last_stamp = now
+        return now
+
 
 ACTION_AMEND = "amend"
 ACTION_REQUEUE = "requeue"
@@ -164,7 +185,7 @@ def emit(
     """
     try:
         event = event_for(from_status, to_status, action)
-        now = datetime.now(UTC)
+        now = _next_stamp()
         eid = str(uuid.uuid4())
         summary = task.get("summary")
         body = {

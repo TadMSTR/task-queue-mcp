@@ -402,3 +402,24 @@ def test_the_writer_matches_the_reference_file_name(tmp_path):
     [p] = [p for p in (tmp_path / events.OUTBOX_DIRNAME).iterdir()]
     m = bus_outbox.NAME_RE.match(p.name)
     assert m and uuid.UUID(m.group(2)).version == 4
+
+
+def test_stamps_are_strictly_increasing_even_when_the_clock_is_not(monkeypatch):
+    frozen = events.datetime(2026, 10, 16, tzinfo=events.UTC)
+
+    class _Clock(events.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen
+
+    monkeypatch.setattr(events, "datetime", _Clock)
+    monkeypatch.setattr(events, "_last_stamp", None)
+    stamps = [events._next_stamp() for _ in range(5)]
+    assert stamps == sorted(stamps) and len(set(stamps)) == 5
+
+
+def test_a_notify_drains_submitted_before_completed(tmp_path):
+    _submit(tmp_path, task_type="notify")
+    names = sorted(p.name for p in (tmp_path / events.OUTBOX_DIRNAME).iterdir())
+    bodies = [json.loads((tmp_path / events.OUTBOX_DIRNAME / n).read_text()) for n in names]
+    assert [b["event"] for b in bodies] == ["task.submitted", "task.completed"]
