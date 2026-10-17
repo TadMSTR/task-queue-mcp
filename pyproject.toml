@@ -17,7 +17,7 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff==0.16.0",
-    "agent-bus @ git+https://github.com/TadMSTR/agent-bus@bc0d21b5fae576f45de97f0ab02c3d4ae870791a",
+    "agent-bus @ git+https://github.com/TadMSTR/agent-bus@41c1adea50d1b2cc5f9fc5849569adc4348af635",
 ]
 
 [build-system]
