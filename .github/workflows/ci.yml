@@ -154,6 +154,13 @@ jobs:
           echo "runtime uid -> $uid"
           [ "$uid" = 1000 ]
 
+          # The event outbox: created at startup inside the queue mount, by the container's
+          # uid, mode 0700. A read-only rootfs must not stop it.
+          outbox=$(stat -c '%u %a' "$QDIR/.outbox")
+          echo "outbox owner/mode -> $outbox"
+          [ "$outbox" = "1000 700" ]
+          if grep -qF 'event outbox' <<<"$logs"; then echo "outbox reported unwritable"; exit 1; fi
+
       - name: Container logs
         if: always()
         run: docker logs "$CONTAINER" || true

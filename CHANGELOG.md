@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-16
+
+Owner-side task lifecycle events. Build `operator-panel-2026-09-p3-lifecycle-events`,
+Phase 2.
+
+### Added
+
+- **Every transition this server writes is reported to agent-bus** as one event file in
+  `<queue>/.outbox/`, written after the task write succeeds and inside the per-task lock:
+  `task.submitted`, `task.approved`, `task.pending-approval`, `task.started`,
+  `task.completed`, `task.failed`, `task.cancelled`, `task.parked`, `task.unparked`,
+  `task.amended`, `task.requeued`, `task.routing-failed`. The mapping covers every
+  (from, to) status pair, and a test fails on an unmapped one. Operator writes carry
+  `channel`; the sweep carries `on_behalf_of`. Agents no longer need to log task events by
+  hand. Until now they did, and most transitions were never logged.
+- Event metadata is a fixed set of short fields. `payload.description`, amendment text and
+  result output never appear in an event (tested with a sentinel).
+- An unwritable outbox is logged at error and never fails the write.
+- `submit_task` takes optional `build_name` (the dispatcher's audit build-name charset,
+  `[A-Za-z0-9_-]`, 1-128) and `audit_round` (1-20, `audit` / `ticket_audit` only), stored
+  top-level and returned by `get_task` / `list_tasks`. They let a build's audit rounds be
+  joined and counted instead of read out of description prose.
+- Test-only dev dependency on agent-bus, pinned by SHA: every event file is checked against
+  agent-bus's own outbox validator.
+
 ## [0.13.0] - 2026-09-30
 
 Fast read path, non-blocking HTTP routes, and a published image. Build

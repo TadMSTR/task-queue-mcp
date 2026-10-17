@@ -9,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 
 import yaml
 
+from src.tools import events
+
 logger = logging.getLogger(__name__)
 
 VALID_RISK_LEVELS = {"low", "medium", "high"}
@@ -176,6 +178,16 @@ LOCATION_DEAD_LETTER = "dead-letters"
 # caller must be able to tell a dead-lettered record from a live one without inspecting
 # file paths — which it cannot see anyway, since `_path` is stripped on the way out.
 QUEUE_LOCATION_KEY = "queue_location"
+
+# build_name: the dispatcher's own audit build-name charset (task_dispatcher.cli,
+# launch_security_audit: `[a-zA-Z0-9_\-]+`), so a name accepted here is one the dispatcher
+# would also accept — no dots, no slashes. The 128 cap is this server's: the name ends up
+# in event metadata, and agent-bus caps that.
+_BUILD_NAME_RE = re.compile(r"[a-zA-Z0-9_\-]{1,128}")
+AUDIT_ROUND_MIN = 1
+AUDIT_ROUND_MAX = 20
+# Only audits have rounds. Allowing the field anywhere would let it mean nothing.
+AUDIT_TASK_TYPES = {"audit", "ticket_audit"}
 
 # context_refs validation: enforce absolute paths (must start with '/').
 # Trust model: we do not restrict to a specific prefix allowlist — consumers
@@ -450,6 +462,8 @@ def submit_task_handler(
     workflow_mode: str = "semi-auto",
     originating_task_id: str | None = None,
     queue_dir: str | None = None,
+    build_name: str | None = None,
+    audit_round: int | None = None,
 ) -> dict:
     if context_refs is None:
         context_refs = []
@@ -507,6 +521,42 @@ def submit_task_handler(
         err = _validate_context_refs(context_refs)
         if err:
             return {"ok": False, "error": err}
+
+    # Both optional, so every existing caller is unchanged. They exist so a build's audit
+    # rounds are structured: the timeline joins tasks on build_name, and audit_round says
+    # which round an audit task is, where before both lived only in description prose.
+    if build_name is not None and (
+        not isinstance(build_name, str) or not _BUILD_NAME_RE.fullmatch(build_name)
+    ):
+        return {
+            "ok": False,
+            "error": (
+                f"Invalid build_name: {build_name!r} — letters, digits, '_' and '-' only "
+                f"(no dots, no slashes), 1-128 characters"
+            ),
+        }
+    if audit_round is not None:
+        # bool is an int subclass; True must not read as round 1.
+        if (
+            isinstance(audit_round, bool)
+            or not isinstance(audit_round, int)
+            or not AUDIT_ROUND_MIN <= audit_round <= AUDIT_ROUND_MAX
+        ):
+            return {
+                "ok": False,
+                "error": (
+                    f"Invalid audit_round: {audit_round!r} — an integer from "
+                    f"{AUDIT_ROUND_MIN} to {AUDIT_ROUND_MAX}"
+                ),
+            }
+        if task_type not in AUDIT_TASK_TYPES:
+            return {
+                "ok": False,
+                "error": (
+                    f"audit_round is only valid for task_type {sorted(AUDIT_TASK_TYPES)}, "
+                    f"not {task_type!r}"
+                ),
+            }
 
     task_id = str(uuid.uuid4())
     now = _now()
@@ -585,7 +635,18 @@ def submit_task_handler(
             }
         )
 
+    if build_name is not None:
+        task["build_name"] = build_name
+    if audit_round is not None:
+        task["audit_round"] = audit_round
+
     _write_task_atomic(path, task)
+
+    # A self-terminal task was written as `completed` in one write, but its history reads
+    # submitted → completed, and so do its events: the feed should show it arrive and end.
+    events.emit(queue_dir, task, None, "submitted", source_agent)
+    if self_terminal:
+        events.emit(queue_dir, task, "submitted", "completed", source_agent)
 
     result = {"ok": True, "task_id": task_id, "filename": filename}
     if self_terminal:
@@ -960,6 +1021,15 @@ def update_task_handler(
         # retry_policy is owned by the task-dispatcher — never modify it
         path = task.pop("_path")
         _write_task_atomic(path, task)
+        events.emit(
+            queue_dir,
+            task,
+            current_status,
+            status,
+            actor,
+            channel=channel,
+            on_behalf_of=on_behalf_of,
+        )
 
     logger.info(
         "task.transition id=%s %s→%s actor=%s%s",
@@ -1261,6 +1331,7 @@ def set_task_status_handler(
         # retry_policy is owned by the task-dispatcher — never modify it
         path = task.pop("_path")
         _write_task_atomic(path, task)
+        events.emit(queue_dir, task, current_status, status, actor, channel=channel)
 
     logger.info(
         "task.operator_transition id=%s %s→%s actor=%s override=%s",
@@ -1513,6 +1584,15 @@ def amend_task_handler(
         # retry_policy is owned by the task-dispatcher — never modify it
         path = task.pop("_path")
         _write_task_atomic(path, task)
+        events.emit(
+            queue_dir,
+            task,
+            current_status,
+            current_status,
+            actor,
+            channel=channel,
+            action=events.ACTION_AMEND,
+        )
 
     logger.info(
         "task.amend id=%s actor=%s count=%d status=%s",
@@ -1653,6 +1733,15 @@ def requeue_dead_letter_handler(
         # reverse order can lose it entirely. Same order the dispatcher uses on the way in.
         _write_task_atomic(dest, task)
         os.remove(src)
+        events.emit(
+            queue_dir,
+            task,
+            previous_status,
+            "submitted",
+            actor,
+            channel=channel,
+            action=events.ACTION_REQUEUE,
+        )
 
     logger.info(
         "task.requeue id=%s %s→submitted actor=%s from=%s",

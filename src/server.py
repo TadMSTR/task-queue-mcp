@@ -26,6 +26,7 @@ from src.auth import (
     require_operator_surface,
     retired_secret_set,
 )
+from src.tools.events import ensure_outbox
 from src.tools.queue import (
     LIST_PAGE_MAX,
     NON_TERMINAL_STATUSES,
@@ -69,6 +70,9 @@ async def lifespan(app):
     # Named at startup so a slow deployment can be diagnosed from its log: SafeLoader here
     # means PyYAML lost libyaml, and every read is ~10x slower (vikunja#1003).
     logger.info("YAML loader: %s", YAML_LOADER_NAME)
+    # Event loss must never block a queue write: an unwritable outbox is an error in the
+    # log and nothing more.
+    ensure_outbox(QUEUE_DIR)
     yield
     logger.info("task-queue-mcp shutting down.")
 
@@ -100,6 +104,8 @@ def submit_task(
     ttl_days: int = 30,
     workflow_mode: str = "semi-auto",
     originating_task_id: str | None = None,
+    build_name: str | None = None,
+    audit_round: int | None = None,
 ) -> dict:
     """
     Submit a new task to the queue.
@@ -121,6 +127,10 @@ def submit_task(
       workflow_mode, and if that parent targets you and is approved or in-progress it is
       auto-closed as completed — submitting the return task IS closing the request. This
       still holds for `notify`: a notification closes the request it answers.
+    build_name: optional. The build this task belongs to (letters, digits, '_', '-'; no
+      dots or slashes). Build steps and audit rounds are joined on it.
+    audit_round: optional, 1-20, only for task_type audit or ticket_audit. Round 1 is the
+      first audit of a build; a re-check after remediation is round 2, and so on.
     source_agent must be your own authenticated identity; you cannot file a task as
       another agent.
     Returns: {ok, task_id, filename} on success, plus auto_closed_task_id when a parent was
@@ -148,6 +158,8 @@ def submit_task(
         workflow_mode=workflow_mode,
         originating_task_id=originating_task_id,
         queue_dir=QUEUE_DIR,
+        build_name=build_name,
+        audit_round=audit_round,
     )
 
 
