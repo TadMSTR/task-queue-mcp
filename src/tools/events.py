@@ -194,6 +194,11 @@ def emit(
             "event": event,
             "source": EVENT_SOURCE,
             "target": _short(task.get("target_agent")),
+            # SECURITY[accepted]: the task summary is agent-written free text and reaches
+            # the bus, cut to 200 chars. Not new exposure: list_tasks, Matrix titles and
+            # task.routing-failed already carry it. Readers (operator panel, task feed)
+            # must escape it on render. Audit: 2026-10-16/operator-panel-2026-09-p3-
+            # lifecycle-events (F-10, Info).
             "summary": (summary if isinstance(summary, str) else "")[:SUMMARY_CHARS],
             "metadata": build_metadata(task, from_status, to_status, actor, channel, on_behalf_of),
         }
