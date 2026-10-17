@@ -111,11 +111,23 @@ def test_server_park_and_unpark(server, tmp_path):
 
 
 def test_server_unpark_explicit_status(server):
+    """
+    This used to have developer park its own `submitted` task and unpark it to `approved` —
+    the F-01 self-approval, asserted as a feature. An explicit target is the operator's
+    move; the agent-side refusals live in test_adversarial.py.
+    """
     r = _submit(server)
-    server.park_task(task_id=r["task_id"], actor="developer")
-    u = server.unpark_task(task_id=r["task_id"], actor="developer", status="approved")
+    server.park_task(task_id=r["task_id"], actor="operator")
+    u = server.unpark_task(task_id=r["task_id"], actor="operator", status="approved")
     assert u["ok"] is True
     assert server.get_task(r["task_id"])["status"] == "approved"
+
+
+def test_server_agent_cannot_park_then_unpark_its_way_to_approved(server):
+    r = _submit(server)
+    p = server.park_task(task_id=r["task_id"], actor="developer")
+    assert p["ok"] is False
+    assert server.get_task(r["task_id"])["status"] == "submitted"
 
 
 def test_server_park_refuses_a_non_owner(server):

@@ -108,6 +108,15 @@ OPERATOR_TRANSITIONS: dict[str, set[str]] = {
 # non-terminal → non-terminal move, so it goes through the audited allow_override path.
 PARKED_FROM_KEY = "parked_from"
 
+# Statuses an agent may not park its own task from. Park + unpark is the only agent-held
+# non-terminal → non-terminal move, so it must not be a way across the approval gate:
+# nothing legitimate needs an agent to pause work it has not been cleared to start, and
+# `routing-failed` belongs to the dispatcher's retry loop. The operator may still park from
+# any non-terminal status. Unparking is the other half — an agent may only restore the
+# recorded `parked_from`, never choose a target (F-01, research-task-pickup-2026-10-p1-
+# manifest-grant audit; vikunja#1135).
+AGENT_PARK_REFUSED_FROM = {"submitted", "pending-approval", "routing-failed"}
+
 # Statuses the submit-time auto-close (_auto_close_originating_task) may fire from.
 # Deliberately narrower than "any non-terminal": `completed` is only reachable from
 # `in-progress`, and each remaining non-terminal status is one the auto-close must not
@@ -1207,7 +1216,8 @@ def set_task_status_handler(
     the direct handler calls predate any ownership rule; the MCP park/unpark tools pass it
     on, which is what lets an agent pause its own work without being able to pause anyone
     else's. The remaining transitions this handler serves stay operator-only, so they never
-    reach it with it set.
+    reach it with it set. With it set, a non-operator actor is further held to the agent
+    path: no parking from AGENT_PARK_REFUSED_FROM, and unparking only to `parked_from`.
     """
     if queue_dir is None:
         queue_dir = os.environ.get("TASK_QUEUE_DIR", "/task-queue")
@@ -1253,6 +1263,28 @@ def set_task_status_handler(
                         f"({owner!r}) and may not park or unpark it."
                     ),
                 }
+
+            # Agent path. Checked here, under the lock, rather than in the wrappers: the
+            # wrappers read the task before the lock is taken, so a check made there could
+            # be validated against a parked_from that has since changed.
+            if actor != OPERATOR_ACTOR:
+                if status == "parked" and current_status in AGENT_PARK_REFUSED_FROM:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"an agent may not park a task in status {current_status!r} — "
+                            "it has not been cleared to start. Ask the operator to park it."
+                        ),
+                    }
+                if current_status == "parked" and status != task.get(PARKED_FROM_KEY):
+                    return {
+                        "ok": False,
+                        "error": (
+                            "an agent may only unpark a task to the status it was parked "
+                            f"from ({task.get(PARKED_FROM_KEY)!r}), not {status!r}. Ask the "
+                            "operator to move it anywhere else."
+                        ),
+                    }
 
         standard_ok = current_status in OPERATOR_TRANSITIONS.get(status, set())
         override_ok = (
@@ -1380,13 +1412,16 @@ def park_task_handler(
     pickup loops (which match `submitted` and `routing-failed`) skip it and nothing sweeps
     it at TTL. The prior status is recorded in `parked_from` for unpark_task.
 
+    With enforce_ownership, an agent may not park a task it has not been cleared to start
+    (submitted, pending-approval, routing-failed); see AGENT_PARK_REFUSED_FROM.
+
     Thin wrapper over set_task_status_handler, same as cancel_task.
     """
     return set_task_status_handler(
         task_id=task_id,
         status="parked",
         actor=actor,
-        note=note or "Parked by operator",
+        note=note or f"Parked by {actor}",
         queue_dir=queue_dir,
         enforce_ownership=enforce_ownership,
         channel=channel,
@@ -1407,6 +1442,11 @@ def unpark_task_handler(
     somewhere else instead. Errors if the task is not parked, or if it carries no
     `parked_from` (a task parked before this field existed, or by a direct-YAML writer) and
     no explicit status was given.
+
+    With enforce_ownership, an agent may only restore `parked_from`: an explicit `status`
+    that differs from it, or any unpark of a task with no `parked_from`, is refused and
+    left to the operator. Otherwise park → unpark(status="approved") would let an agent
+    approve its own task. That check is made under the lock in set_task_status_handler.
 
     SECURITY[accepted]: the target status is resolved from a read taken *outside* the write
     lock, because set_task_status_handler acquires the same non-reentrant fcntl lock and
@@ -1459,7 +1499,7 @@ def unpark_task_handler(
         task_id=task_id,
         status=target,
         actor=actor,
-        note=note or f"Unparked by operator (→ {target})",
+        note=note or f"Unparked by {actor} (→ {target})",
         allow_override=True,
         queue_dir=queue_dir,
         enforce_ownership=enforce_ownership,

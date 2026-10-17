@@ -293,3 +293,128 @@ def test_an_agent_can_park_its_own_task(server, victim_task, monkeypatch):
 
     assert out["ok"] is True
     assert server.get_task(victim_task)["status"] == "parked"
+
+
+# --------------------------------------------------------------------------- #
+# Park + unpark is not a way across the approval gate
+# (F-01/F-02, research-task-pickup-2026-10-p1-manifest-grant audit; vikunja#1135)
+# --------------------------------------------------------------------------- #
+
+
+def _status_on_disk(tmp_path, task_id, status):
+    """Write a status directly — the statuses under test are ones no agent can reach."""
+    path = next(p for p in tmp_path.glob("*.yml") if task_id in p.read_text())
+    data = yaml.safe_load(path.read_text())
+    data["status"] = status
+    path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+
+
+@pytest.fixture
+def as_victim(monkeypatch):
+    """Authenticate every call in the test as the task's own target agent."""
+    monkeypatch.setattr(auth_mod, "resolve_identity", lambda: VICTIM)
+
+
+@pytest.fixture
+def unapproved_task(server, monkeypatch, tmp_path):
+    """A task addressed to VICTIM, still waiting on the operator."""
+    monkeypatch.setattr(auth_mod, "resolve_identity", lambda: "research")
+    r = _seed(server)
+    _status_on_disk(tmp_path, r["task_id"], "pending-approval")
+    return r["task_id"]
+
+
+def _operator_park(tmp_path, task_id):
+    from src.tools.queue import park_task_handler
+
+    out = park_task_handler(task_id=task_id, actor="operator", queue_dir=str(tmp_path))
+    assert out["ok"] is True, out
+
+
+def test_agent_cannot_self_approve_by_park_then_unpark(server, unapproved_task, as_victim):
+    """The F-01 chain: pending-approval → park → unpark(status="approved")."""
+    server.park_task(task_id=unapproved_task, actor=VICTIM)
+    server.unpark_task(task_id=unapproved_task, actor=VICTIM, status="approved")
+
+    assert server.get_task(unapproved_task)["status"] == "pending-approval"
+
+
+def test_agent_unpark_cannot_choose_approved(server, unapproved_task, tmp_path, as_victim):
+    """Even on a task the operator parked, the agent may only restore parked_from."""
+    _operator_park(tmp_path, unapproved_task)
+
+    out = server.unpark_task(task_id=unapproved_task, actor=VICTIM, status="approved")
+
+    assert out["ok"] is False
+    assert "parked from" in out["error"]
+    assert server.get_task(unapproved_task)["status"] == "parked"
+
+
+def test_agent_unpark_cannot_choose_routing_failed(server, victim_task, as_victim):
+    """routing-failed is read by the dispatcher as already approved and relaunched."""
+    assert server.park_task(task_id=victim_task, actor=VICTIM)["ok"] is True
+
+    out = server.unpark_task(task_id=victim_task, actor=VICTIM, status="routing-failed")
+
+    assert out["ok"] is False
+    assert server.get_task(victim_task)["status"] == "parked"
+
+
+def test_agent_unpark_without_parked_from_is_left_to_the_operator(
+    server, victim_task, tmp_path, as_victim
+):
+    """A legacy parked task has no recorded origin, so the agent has nothing to restore."""
+    _status_on_disk(tmp_path, victim_task, "parked")
+
+    out = server.unpark_task(task_id=victim_task, actor=VICTIM, status="approved")
+
+    assert out["ok"] is False
+    assert server.get_task(victim_task)["status"] == "parked"
+
+
+def test_agent_may_still_restore_parked_from_explicitly(server, victim_task, as_victim):
+    """Passing the recorded status back is a restore, not a choice, and stays allowed."""
+    assert server.park_task(task_id=victim_task, actor=VICTIM)["ok"] is True
+
+    out = server.unpark_task(task_id=victim_task, actor=VICTIM, status="in-progress")
+
+    assert out["ok"] is True
+    assert server.get_task(victim_task)["status"] == "in-progress"
+
+
+@pytest.mark.parametrize("status", ["submitted", "pending-approval", "routing-failed"])
+def test_agent_cannot_park_an_uncleared_task(server, unapproved_task, tmp_path, as_victim, status):
+    _status_on_disk(tmp_path, unapproved_task, status)
+
+    out = server.park_task(task_id=unapproved_task, actor=VICTIM)
+
+    assert out["ok"] is False
+    assert "not been cleared to start" in out["error"]
+    assert server.get_task(unapproved_task)["status"] == status
+
+
+@pytest.mark.parametrize("target", ["approved", "routing-failed", "pending-approval"])
+def test_operator_unpark_to_any_non_terminal_status_still_works(
+    server, victim_task, tmp_path, target
+):
+    """The operator path is unchanged: it may still send a parked task anywhere."""
+    from src.tools.queue import unpark_task_handler
+
+    _operator_park(tmp_path, victim_task)
+
+    out = unpark_task_handler(
+        task_id=victim_task, actor="operator", status=target, queue_dir=str(tmp_path)
+    )
+
+    assert out["ok"] is True, out
+    assert server.get_task(victim_task)["status"] == target
+
+
+def test_park_and_unpark_notes_name_the_acting_agent(server, victim_task, as_victim):
+    """F-02: an agent's park/unpark must not be recorded as the operator's."""
+    server.park_task(task_id=victim_task, actor=VICTIM)
+    server.unpark_task(task_id=victim_task, actor=VICTIM)
+
+    notes = [h["note"] for h in server.get_task(victim_task)["history"][-2:]]
+    assert notes == [f"Parked by {VICTIM}", f"Unparked by {VICTIM} (→ in-progress)"]
+    assert not any("operator" in n for n in notes)

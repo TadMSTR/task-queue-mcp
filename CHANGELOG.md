@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-17
+
+Security fix. Audit `research-task-pickup-2026-10-p1-manifest-grant`, F-01 (Medium) and
+F-02 (Low); vikunja#1135.
+
+### Security
+
+- **An agent can no longer approve its own task with park + unpark.** `unpark_task` ran
+  through the operator's override path, so the target agent could park a `submitted` or
+  `pending-approval` task and unpark it with `status="approved"`, or with
+  `status="routing-failed"`, which task-dispatcher treats as already approved and, in auto
+  mode, launches headless. On the MCP tools (agent path) an unpark now only restores the
+  recorded `parked_from`; an explicit `status` that differs from it, or an unpark of a task
+  with no `parked_from`, is refused. An agent also may not park a task from `submitted`,
+  `pending-approval` or `routing-failed`. Both checks run under the per-task lock. The
+  operator path (HTTP control routes, `actor="operator"`) is unchanged and may still park
+  from, or unpark to, any non-terminal status.
+
+### Fixed
+
+- **Park and unpark history notes name the actor** (`Parked by <actor>`,
+  `Unparked by <actor> (→ <status>)`). They said "by operator" whoever made the call,
+  so an agent's unpark read as the operator's.
+
 ## [0.14.0] - 2026-10-16
 
 Owner-side task lifecycle events. Build `operator-panel-2026-09-p3-lifecycle-events`,
