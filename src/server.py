@@ -323,7 +323,8 @@ def park_task(task_id: str, actor: str, note: str = "") -> dict:
     keeps appearing in list_tasks, but nothing will pick it up until it is unparked, and
     it is exempt from TTL expiry. Use for "not now, but don't lose this". Reversible via
     unpark_task, which returns it to the status it was parked from.
-    You may park a task addressed to you; the operator may park any task.
+    You may park a task addressed to you once it is approved or in progress; the operator
+    may park any task.
     Returns {ok, task_id} or {ok: false, error}.
     """
     ok, actor = bind_actor(actor)
@@ -342,9 +343,9 @@ def park_task(task_id: str, actor: str, note: str = "") -> dict:
 @mcp.tool()
 def unpark_task(task_id: str, actor: str, note: str = "", status: str | None = None) -> dict:
     """
-    Unpark a task, returning it to the status it was parked from. Pass status to send it
-    somewhere else instead. Reverses park_task.
-    You may unpark a task addressed to you; the operator may unpark any task.
+    Unpark a task, returning it to the status it was parked from. Reverses park_task.
+    You may unpark a task addressed to you, to the status it was parked from only; status,
+    if passed, must be that status. Only the operator may send a parked task elsewhere.
     Returns {ok, task_id} or {ok: false, error}.
     """
     ok, actor = bind_actor(actor)

@@ -194,7 +194,9 @@ unpark_task(task_id="...", actor="operator", status=None)
 # → returns the task to the status it was parked from
 ```
 
-Parking changes only the status — the YAML never moves. The task keeps appearing in `list_tasks`, is exempt from TTL expiry, and nothing picks it up, because the dispatcher's pickup loops match `submitted` and `routing-failed` only. The prior status is recorded in `parked_from` and cleared on the way out, so it can never go stale. Pass `status` to `unpark_task` to send the task somewhere other than where it came from — required for a task parked by a direct-YAML writer, which carries no `parked_from`.
+Parking changes only the status — the YAML never moves. The task keeps appearing in `list_tasks`, is exempt from TTL expiry, and nothing picks it up, because the dispatcher's pickup loops match `submitted` and `routing-failed` only. The prior status is recorded in `parked_from` and cleared on the way out, so it can never go stale. The operator may pass `status` to `unpark_task` to send the task somewhere other than where it came from — required for a task parked by a direct-YAML writer, which carries no `parked_from`.
+
+An agent may not. On the agent path an unpark only restores `parked_from`, and an agent cannot park a task that is `submitted`, `pending-approval` or `routing-failed`. Both rules exist so that park + unpark cannot carry a task across the approval gate: until v0.14.1 an agent could park its own unapproved task and unpark it to `approved`, or to `routing-failed`, which the dispatcher relaunches as already approved. The history note names whoever parked or unparked (`Parked by <actor>`).
 
 Park is for "not now, but don't lose this". A long-idle task is not necessarily neglect, and `parked` is the vocabulary that distinguishes a deliberate bookmark from something genuinely abandoned.
 
@@ -554,7 +556,7 @@ This covers `source_agent` on `submit_task` too, which is an identity claim and 
 |---|---|
 | `submit_task`, `list_tasks`, `get_task` | any authenticated agent (`source_agent` is bound to the caller) |
 | `update_task` | the task's `target_agent`, or the operator |
-| `park_task`, `unpark_task` | the task's `target_agent`, or the operator |
+| `park_task`, `unpark_task` | the task's `target_agent` (park only once approved; unpark only to `parked_from`), or the operator |
 | `amend_task` | the task's `source_agent`, or the operator |
 | `set_task_status`, `cancel_task`, `requeue_dead_letter` | **operator only** — refused for any agent identity |
 
