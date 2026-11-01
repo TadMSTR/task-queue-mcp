@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-01
+
+### Added
+
+- **A return task inherits `audit_round` from the audit it answers.** When
+  `originating_task_id` names an `audit` or `ticket_audit` task that has `audit_round`,
+  the new task has the same `build_name`, and the new task is that audit's return (it is
+  addressed back to the asker by the audit's target, the shape the auto-close checks, and
+  is not itself an audit type), the round is copied onto it. A forward task that cites the
+  audit, or a later audit request that omits its round, gets nothing. A security return is
+  `build`, so before this it could never say which round it closed. The value is read from the queue, never from the caller:
+  passing `audit_round` on a non-audit type is still refused. A missing parent or an
+  unreadable queue creates the task without the field; the submit doesn't fail. The
+  lifecycle events for the task carry the inherited round.
+
 ## [0.14.1] - 2026-10-17
 
 Security fix. Audit `research-task-pickup-2026-10-p1-manifest-grant`, F-01 (Medium) and

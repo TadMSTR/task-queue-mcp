@@ -130,7 +130,10 @@ def submit_task(
     build_name: optional. The build this task belongs to (letters, digits, '_', '-'; no
       dots or slashes). Build steps and audit rounds are joined on it.
     audit_round: optional, 1-20, only for task_type audit or ticket_audit. Round 1 is the
-      first audit of a build; a re-check after remediation is round 2, and so on.
+      first audit of a build; a re-check after remediation is round 2, and so on. Don't
+      pass it on a return: a task whose originating_task_id names an audit or
+      ticket_audit task with the same build_name inherits that task's round, read from
+      the queue.
     source_agent must be your own authenticated identity; you cannot file a task as
       another agent.
     Returns: {ok, task_id, filename} on success, plus auto_closed_task_id when a parent was

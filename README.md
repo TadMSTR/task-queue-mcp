@@ -46,12 +46,16 @@ submit_task(
     workflow_mode="semi-auto",  # semi-auto | auto | manual-then-auto (default: semi-auto)
     originating_task_id=None,  # UUID of the parent task, if this is a return task
     build_name=None,  # optional: the build this task belongs to ([A-Za-z0-9_-], ≤128)
-    audit_round=None,  # optional, 1-20, audit / ticket_audit only
+    audit_round=None,  # optional, 1-20, audit / ticket_audit only (a return inherits it)
 )
 # → {"ok": true, "task_id": "<uuid>", "filename": "<timestamp>-<slug>.yml"}
 ```
 
 `context_refs` must be absolute paths. `risk_level` and `priority` are validated against allowlists. `workflow_mode` controls dispatcher behavior: `semi-auto` (default) queues the task for operator pickup with a Matrix notification, while `auto` triggers the dispatcher to launch the target agent headlessly. `manual-then-auto` gates only its own leg — this task waits for an operator Start exactly like `semi-auto`, but every task the resulting session spawns inherits `auto`. The mode is stored verbatim on the parent task; the downgrade to `auto` for children happens in the dispatcher, not here, so a reader inspecting the stored YAML sees `manual-then-auto` unchanged. The server generates the UUID, sets `created`, and initializes the `retry_policy` stub.
+
+#### A return inherits `audit_round` (since v0.15.0)
+
+A security return is `task_type: build`, so it can't carry `audit_round` itself. Instead it inherits one: when `originating_task_id` names an `audit` or `ticket_audit` task with a valid `audit_round`, the new task has the same `build_name`, and the new task is that audit's return, the round is copied onto the new task. "Return" is the shape the auto-close checks: the new task's source is the audit's target and its target is the audit's source, and it is not itself an `audit`/`ticket_audit` task. So a forward task that cites the audit (a deploy task to sysadmin, say), or a round-N+1 audit request that leaves out its round, inherits nothing. The value comes from the stored parent, never from the caller, and `audit_round` passed on a non-audit type is still refused. A return with no `build_name` never inherits, and an `audit`/`ticket_audit` task that passes its own round keeps it. The parent is looked up in the queue and the archive. If it is missing, malformed, or the lookup fails, the task is created without the field. The lifecycle events for the task carry the inherited round like any other.
 
 #### `notify` is self-terminal
 

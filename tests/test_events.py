@@ -389,6 +389,206 @@ def test_audit_round_is_refused_off_an_audit(tmp_path):
     assert not r["ok"] and "only valid" in r["error"]
 
 
+# ---------------------------------------------------------------------------
+# audit_round inherited onto a return task (audit-workflow-2026-11 p1)
+# ---------------------------------------------------------------------------
+
+
+# Every negative test below submits in the return shape, so it is the condition it names, not
+# a missing return shape, that keeps the round off.
+_AUDIT = {"source_agent": "developer", "target_agent": "security"}
+_RETURN = {"source_agent": "security", "target_agent": "developer"}
+
+
+def _audit_then_return(
+    tmp_path, *, audit_type="audit", audit_build="b-1", return_build="b-1", audit_round=2
+):
+    from src.tools.queue import get_task_handler
+
+    kw = {"audit_round": audit_round} if audit_round is not None else {}
+    a = _submit(
+        tmp_path,
+        source_agent="developer",
+        target_agent="security",
+        task_type=audit_type,
+        build_name=audit_build,
+        **kw,
+    )
+    r = _submit(
+        tmp_path,
+        source_agent="security",
+        target_agent="developer",
+        task_type="build",
+        build_name=return_build,
+        originating_task_id=a["task_id"],
+    )
+    return get_task_handler(r["task_id"], queue_dir=str(tmp_path)), r
+
+
+@pytest.mark.parametrize("audit_type", ["audit", "ticket_audit"])
+def test_return_task_inherits_audit_round(tmp_path, audit_type):
+    t, r = _audit_then_return(tmp_path, audit_type=audit_type)
+    assert t["task_type"] == "build" and t["audit_round"] == 2
+    [e] = [e for e in _events(tmp_path) if e["metadata"]["task_id"] == r["task_id"]]
+    assert e["metadata"]["audit_round"] == 2
+
+
+def test_inherited_round_is_stored_on_disk(tmp_path):
+    _, r = _audit_then_return(tmp_path)
+    data = yaml.safe_load((tmp_path / r["filename"]).read_text())
+    assert data["audit_round"] == 2
+
+
+def test_not_inherited_when_build_name_differs(tmp_path):
+    t, _ = _audit_then_return(tmp_path, return_build="b-2")
+    assert "audit_round" not in t
+
+
+def test_not_inherited_without_a_build_name_on_the_return(tmp_path):
+    from src.tools.queue import get_task_handler
+
+    a = _submit(tmp_path, **_AUDIT, task_type="audit", build_name="b-1", audit_round=3)
+    r = _submit(tmp_path, **_RETURN, originating_task_id=a["task_id"])
+    assert "audit_round" not in get_task_handler(r["task_id"], queue_dir=str(tmp_path))
+
+
+def test_not_inherited_from_a_non_audit_parent(tmp_path):
+    from src.tools.queue import get_task_handler
+
+    # A non-audit parent can't hold a round through the API; plant one on disk, as a
+    # direct-YAML writer could, so the type check is what's tested.
+    a = _submit(tmp_path, **_AUDIT, task_type="build", build_name="b-1")
+    f = next(tmp_path.glob(f"*-{a['task_id'][:8]}.yml"))
+    data = yaml.safe_load(f.read_text())
+    data["audit_round"] = 4
+    f.write_text(yaml.safe_dump(data))
+    r = _submit(tmp_path, **_RETURN, build_name="b-1", originating_task_id=a["task_id"])
+    assert "audit_round" not in get_task_handler(r["task_id"], queue_dir=str(tmp_path))
+
+
+def test_not_inherited_when_the_parent_has_no_round(tmp_path):
+    t, _ = _audit_then_return(tmp_path, audit_round=None)
+    assert "audit_round" not in t
+
+
+@pytest.mark.parametrize("bad", [0, 21, True, "2", None])
+def test_an_invalid_round_on_disk_is_not_inherited(tmp_path, bad):
+    from src.tools.queue import get_task_handler
+
+    a = _submit(tmp_path, **_AUDIT, task_type="audit", build_name="b-1", audit_round=1)
+    f = next(tmp_path.glob(f"*-{a['task_id'][:8]}.yml"))
+    data = yaml.safe_load(f.read_text())
+    data["audit_round"] = bad
+    f.write_text(yaml.safe_dump(data))
+    r = _submit(tmp_path, **_RETURN, build_name="b-1", originating_task_id=a["task_id"])
+    assert "audit_round" not in get_task_handler(r["task_id"], queue_dir=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("task_type", ["audit"]),
+        ("task_type", {"a": 1}),
+        ("build_name", ["b-1"]),
+        ("audit_round", [2]),
+    ],
+)
+def test_a_malformed_parent_never_fails_the_submit(tmp_path, field, bad):
+    from src.tools.queue import get_task_handler
+
+    a = _submit(tmp_path, **_AUDIT, task_type="audit", build_name="b-1", audit_round=2)
+    f = next(tmp_path.glob(f"*-{a['task_id'][:8]}.yml"))
+    data = yaml.safe_load(f.read_text())
+    data[field] = bad
+    f.write_text(yaml.safe_dump(data))
+    r = _submit(tmp_path, **_RETURN, build_name="b-1", originating_task_id=a["task_id"])
+    assert "audit_round" not in get_task_handler(r["task_id"], queue_dir=str(tmp_path))
+
+
+def test_caller_round_on_a_return_is_still_refused(tmp_path):
+    a = _submit(tmp_path, **_AUDIT, task_type="audit", build_name="b-1", audit_round=2)
+    r = submit_task_handler(
+        "security",
+        "developer",
+        "build",
+        "s",
+        "d",
+        queue_dir=str(tmp_path),
+        build_name="b-1",
+        originating_task_id=a["task_id"],
+        audit_round=2,
+    )
+    assert not r["ok"] and "only valid" in r["error"]
+
+
+def test_missing_parent_creates_the_task_without_the_field(tmp_path):
+    from src.tools.queue import get_task_handler
+
+    r = _submit(tmp_path, **_RETURN, build_name="b-1", originating_task_id=str(uuid.uuid4()))
+    assert "audit_round" not in get_task_handler(r["task_id"], queue_dir=str(tmp_path))
+
+
+def test_unreadable_queue_creates_the_task_without_the_field(tmp_path, monkeypatch):
+    from src.tools import queue as q
+
+    a = _submit(tmp_path, **_AUDIT, task_type="audit", build_name="b-1", audit_round=2)
+
+    def boom(*a, **k):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(q, "_find_task", boom)
+    r = q.submit_task_handler(
+        "security",
+        "developer",
+        "build",
+        "s",
+        "d",
+        queue_dir=str(tmp_path),
+        build_name="b-1",
+        originating_task_id=a["task_id"],
+    )
+    assert r["ok"], r
+    data = yaml.safe_load((tmp_path / r["filename"]).read_text())
+    assert "audit_round" not in data
+
+
+@pytest.mark.parametrize(
+    "child",
+    [
+        # a forward task that cites the audit: developer -> sysadmin deploy
+        {"source_agent": "developer", "target_agent": "sysadmin", "task_type": "build"},
+        # a round-N+1 audit request that omits its round
+        {"source_agent": "developer", "target_agent": "security", "task_type": "audit"},
+        # return-shaped, but itself an audit type
+        {"source_agent": "security", "target_agent": "developer", "task_type": "ticket_audit"},
+        # half the shape: security answering someone other than the asker
+        {"source_agent": "security", "target_agent": "sysadmin", "task_type": "build"},
+    ],
+)
+def test_only_the_return_inherits_the_round(tmp_path, child):
+    """Audit F-02: the round marks the reply to that audit, nothing else that cites it."""
+    from src.tools.queue import get_task_handler
+
+    a = _submit(tmp_path, **_AUDIT, task_type="audit", build_name="b-1", audit_round=1)
+    r = _submit(tmp_path, build_name="b-1", originating_task_id=a["task_id"], **child)
+    assert "audit_round" not in get_task_handler(r["task_id"], queue_dir=str(tmp_path))
+
+
+def test_an_audit_task_keeps_its_own_round(tmp_path):
+    # An audit that names an earlier audit as its origin keeps the round it was given.
+    from src.tools.queue import get_task_handler
+
+    a = _submit(tmp_path, task_type="audit", build_name="b-1", audit_round=1)
+    b = _submit(
+        tmp_path,
+        task_type="audit",
+        build_name="b-1",
+        audit_round=2,
+        originating_task_id=a["task_id"],
+    )
+    assert get_task_handler(b["task_id"], queue_dir=str(tmp_path))["audit_round"] == 2
+
+
 def test_a_refused_submit_writes_no_task_and_no_event(tmp_path):
     submit_task_handler(
         "research", "developer", "build", "s", "d", queue_dir=str(tmp_path), build_name="a.b"
