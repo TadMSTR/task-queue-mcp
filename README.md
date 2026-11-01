@@ -55,7 +55,7 @@ submit_task(
 
 #### A return inherits `audit_round` (since v0.15.0)
 
-A security return is `task_type: build`, so it can't carry `audit_round` itself. Instead it inherits one: when `originating_task_id` names an `audit` or `ticket_audit` task with a valid `audit_round`, and the new task has the same `build_name`, the round is copied onto the new task. The value comes from the stored parent, never from the caller, and `audit_round` passed on a non-audit type is still refused. The parent is looked up in the queue and the archive. If it is missing, or the lookup fails, the task is created without the field. The lifecycle events for the task carry the inherited round like any other.
+A security return is `task_type: build`, so it can't carry `audit_round` itself. Instead it inherits one: when `originating_task_id` names an `audit` or `ticket_audit` task with a valid `audit_round`, and the new task has the same `build_name`, the round is copied onto the new task. The value comes from the stored parent, never from the caller, and `audit_round` passed on a non-audit type is still refused. A return with no `build_name` never inherits, and an `audit`/`ticket_audit` task that passes its own round keeps it. The parent is looked up in the queue and the archive. If it is missing, malformed, or the lookup fails, the task is created without the field. The lifecycle events for the task carry the inherited round like any other.
 
 #### `notify` is self-terminal
 

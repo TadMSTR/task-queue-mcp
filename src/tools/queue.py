@@ -476,21 +476,27 @@ def _inherited_audit_round(queue_dir: str, originating_task_id: str, build_name:
     is still refused upstream. Never raises. A missing parent or an unreadable queue means
     the task is created without the field, never that the submit fails.
     """
+    # The whole read is guarded, not just the lookup: the record is YAML any direct writer
+    # can produce, so a list-valued task_type (unhashable, raises on `in`) must not fail the
+    # submit either.
     try:
         parent = _find_task(queue_dir, originating_task_id, include_archived=True)
+        if not isinstance(parent, dict):
+            return None
+        task_type = parent.get("task_type")
+        if not isinstance(task_type, str) or task_type not in AUDIT_TASK_TYPES:
+            return None
+        if parent.get("build_name") != build_name:
+            return None
+        rnd = parent.get("audit_round")
+        return rnd if _is_valid_audit_round(rnd) else None
     except Exception as exc:
         logger.warning(
-            "audit_round inherit skipped: lookup of %s failed (%s)",
+            "audit_round inherit skipped: reading %s failed (%s)",
             originating_task_id[:8],
             type(exc).__name__,
         )
         return None
-    if not parent or parent.get("task_type") not in AUDIT_TASK_TYPES:
-        return None
-    if parent.get("build_name") != build_name:
-        return None
-    rnd = parent.get("audit_round")
-    return rnd if _is_valid_audit_round(rnd) else None
 
 
 def submit_task_handler(

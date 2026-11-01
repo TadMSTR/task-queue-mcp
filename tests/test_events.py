@@ -478,6 +478,27 @@ def test_an_invalid_round_on_disk_is_not_inherited(tmp_path, bad):
     assert "audit_round" not in get_task_handler(r["task_id"], queue_dir=str(tmp_path))
 
 
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("task_type", ["audit"]),
+        ("task_type", {"a": 1}),
+        ("build_name", ["b-1"]),
+        ("audit_round", [2]),
+    ],
+)
+def test_a_malformed_parent_never_fails_the_submit(tmp_path, field, bad):
+    from src.tools.queue import get_task_handler
+
+    a = _submit(tmp_path, task_type="audit", build_name="b-1", audit_round=2)
+    f = next(tmp_path.glob(f"*-{a['task_id'][:8]}.yml"))
+    data = yaml.safe_load(f.read_text())
+    data[field] = bad
+    f.write_text(yaml.safe_dump(data))
+    r = _submit(tmp_path, build_name="b-1", originating_task_id=a["task_id"])
+    assert "audit_round" not in get_task_handler(r["task_id"], queue_dir=str(tmp_path))
+
+
 def test_caller_round_on_a_return_is_still_refused(tmp_path):
     a = _submit(tmp_path, task_type="audit", build_name="b-1", audit_round=2)
     r = submit_task_handler(
