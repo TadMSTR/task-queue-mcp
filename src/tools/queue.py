@@ -457,6 +457,42 @@ def count_dead_letters(queue_dir: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _is_valid_audit_round(value) -> bool:
+    # bool is an int subclass; True must not read as round 1.
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and AUDIT_ROUND_MIN <= value <= AUDIT_ROUND_MAX
+    )
+
+
+def _inherited_audit_round(queue_dir: str, originating_task_id: str, build_name: str) -> int | None:
+    """
+    The audit_round a new task copies from the task it answers, or None.
+
+    Copied only when the originating task is an audit type with a valid round and the same
+    build_name, so a round can't leak across builds or come from a non-audit parent. The
+    record on disk is the only source: an audit_round the caller passes on a non-audit task
+    is still refused upstream. Never raises. A missing parent or an unreadable queue means
+    the task is created without the field, never that the submit fails.
+    """
+    try:
+        parent = _find_task(queue_dir, originating_task_id, include_archived=True)
+    except Exception as exc:
+        logger.warning(
+            "audit_round inherit skipped: lookup of %s failed (%s)",
+            originating_task_id[:8],
+            type(exc).__name__,
+        )
+        return None
+    if not parent or parent.get("task_type") not in AUDIT_TASK_TYPES:
+        return None
+    if parent.get("build_name") != build_name:
+        return None
+    rnd = parent.get("audit_round")
+    return rnd if _is_valid_audit_round(rnd) else None
+
+
 def submit_task_handler(
     source_agent: str,
     target_agent: str,
@@ -545,12 +581,7 @@ def submit_task_handler(
             ),
         }
     if audit_round is not None:
-        # bool is an int subclass; True must not read as round 1.
-        if (
-            isinstance(audit_round, bool)
-            or not isinstance(audit_round, int)
-            or not AUDIT_ROUND_MIN <= audit_round <= AUDIT_ROUND_MAX
-        ):
+        if not _is_valid_audit_round(audit_round):
             return {
                 "ok": False,
                 "error": (
@@ -566,6 +597,11 @@ def submit_task_handler(
                     f"not {task_type!r}"
                 ),
             }
+
+    # A security return is task_type `build`, so it can never carry a round of its own. It
+    # inherits one from the audit it answers. Read from the queue, never from the caller.
+    if audit_round is None and originating_task_id is not None and build_name is not None:
+        audit_round = _inherited_audit_round(queue_dir, originating_task_id, build_name)
 
     task_id = str(uuid.uuid4())
     now = _now()
