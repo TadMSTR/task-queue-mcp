@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-02
+
+### Added
+
+- **A `pre_audit` task type: a build's fixer task** (audit-fixer-2026-11 p2, #1365 (id 1448)).
+  A build agent queues it to itself, and the dispatcher launches a fresh session of that
+  agent on a handoff file whose path it builds from the task's `build_name`, `audit_round`
+  and `handoff_seq`. The server refuses a `pre_audit` task unless the source equals the
+  target, the target is a build agent (`developer`, `sysadmin`, `fleet`), `build_name`,
+  `audit_round` (1-20) and `handoff_seq` are all present, it has no `originating_task_id`,
+  and `requires_approval` is false. Because `source_agent` is bound to the bearer token, an
+  agent can queue only its own fixer. That does not hold against a same-uid process that
+  reads another agent's token (agent isolation, #1193 (id 1276)).
+- **`handoff_seq`**, a new optional `submit_task` field, an integer 0-2. It is required for
+  `pre_audit` and refused on every other type. It is stored on the task and carried in its
+  lifecycle events.
+- `audit_round` is now accepted on `pre_audit` as well as `audit` and `ticket_audit`.
+
 ## [0.15.0] - 2026-11-01
 
 ### Added

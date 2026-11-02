@@ -564,14 +564,17 @@ def test_submit_invalid_task_type_rejected(tmp_path):
 def test_submit_all_valid_task_types_accepted(tmp_path):
     from src.tools.queue import VALID_TASK_TYPES
 
+    # pre_audit has required fields of its own; tests/test_pre_audit.py covers them.
+    fixer = dict(build_name="b-1", audit_round=1, handoff_seq=0)
     for t in VALID_TASK_TYPES:
         result = submit_task_handler(
-            source_agent="dev",
-            target_agent="dev",
+            source_agent="developer",
+            target_agent="developer",
             task_type=t,
             summary="s",
             description="d",
             queue_dir=str(tmp_path),
+            **(fixer if t == "pre_audit" else {}),
         )
         assert result["ok"] is True, f"task_type={t!r} should be valid"
 

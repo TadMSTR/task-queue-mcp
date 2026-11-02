@@ -163,6 +163,7 @@ def build_metadata(
         "workflow_mode": task.get("workflow_mode"),
         "build_name": task.get("build_name"),
         "audit_round": task.get("audit_round"),
+        "handoff_seq": task.get("handoff_seq"),
         "schema": SCHEMA_VERSION,
     }
     return {k: _short(v) for k, v in fields.items() if v is not None}

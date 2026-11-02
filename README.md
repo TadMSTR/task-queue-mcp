@@ -34,7 +34,7 @@ submit_task(
     source_agent="research",
     target_agent="deploy-agent",  # agent name or "auto" for dispatcher routing
     # build | deploy | fix | research | review | audit | notify | docs |
-    # ticket_audit | ticket_audit_complete
+    # ticket_audit | ticket_audit_complete | pre_audit
     task_type="build",
     summary="Deploy qmd update",
     description="Apply the qmd stack update from build plan...",
@@ -46,7 +46,8 @@ submit_task(
     workflow_mode="semi-auto",  # semi-auto | auto | manual-then-auto (default: semi-auto)
     originating_task_id=None,  # UUID of the parent task, if this is a return task
     build_name=None,  # optional: the build this task belongs to ([A-Za-z0-9_-], ≤128)
-    audit_round=None,  # optional, 1-20, audit / ticket_audit only (a return inherits it)
+    audit_round=None,  # optional, 1-20, audit / ticket_audit / pre_audit (a return inherits it)
+    handoff_seq=None,  # 0-2, pre_audit only (and required there)
 )
 # → {"ok": true, "task_id": "<uuid>", "filename": "<timestamp>-<slug>.yml"}
 ```
@@ -56,6 +57,22 @@ submit_task(
 #### A return inherits `audit_round` (since v0.15.0)
 
 A security return is `task_type: build`, so it can't carry `audit_round` itself. Instead it inherits one: when `originating_task_id` names an `audit` or `ticket_audit` task with a valid `audit_round`, the new task has the same `build_name`, and the new task is that audit's return, the round is copied onto the new task. "Return" is the shape the auto-close checks: the new task's source is the audit's target and its target is the audit's source, and it is not itself an `audit`/`ticket_audit` task. So a forward task that cites the audit (a deploy task to sysadmin, say), or a round-N+1 audit request that leaves out its round, inherits nothing. The value comes from the stored parent, never from the caller, and `audit_round` passed on a non-audit type is still refused. A return with no `build_name` never inherits, and an `audit`/`ticket_audit` task that passes its own round keeps it. The parent is looked up in the queue and the archive. If it is missing, malformed, or the lookup fails, the task is created without the field. The lifecycle events for the task carry the inherited round like any other.
+
+#### `pre_audit`: a build's fixer task (since v0.16.0)
+
+A build agent queues a `pre_audit` task to itself when a build finishes, and the dispatcher launches a fresh session of that agent to run the pre-audit loop (`shared-build-fixer`). The dispatcher builds the handoff path from the task's fields, `fixer-handoffs/<build_name>/r<audit_round>-h<handoff_seq>.md`, so the server refuses a `pre_audit` task unless all of these hold:
+
+| Rule | Why |
+|---|---|
+| `source_agent == target_agent` | an agent can queue only its own fixer |
+| `target_agent` is `developer`, `sysadmin` or `fleet` | the fixer is a build agent |
+| `build_name` is present | the path is built from it |
+| `audit_round` is present, 1-20 | the round in the path |
+| `handoff_seq` is present, 0-2 | the `h<k>` in the path: 0 is the first session, 1 and 2 are relays |
+| no `originating_task_id` | a fixer is not a return; the auto-close and the round ledger would read it as one |
+| `requires_approval` is false | an approval gate on a self-addressed fixer is a stall |
+
+`handoff_seq` is refused on every other type. `source_agent` is bound to the caller's bearer token, so the first rule means an agent cannot queue a fixer for another agent. That binding holds against mistakes and prompt injection, not against a process running as the same uid that reads another agent's token: every agent except steward runs as one uid. The dispatcher re-checks every rule, because a queue file can be written without going through this server.
 
 #### `notify` is self-terminal
 
@@ -278,7 +295,7 @@ format is agent-bus's outbox contract (its README, "Producer Outboxes").
 
 Metadata: `task_id`, `from_status`, `to_status`, `actor`, `channel`, `on_behalf_of`,
 `source_agent`, `target_agent`, `task_type`, `workflow_mode`, `build_name`, `audit_round`,
-`schema`; keys with no value are omitted. The event summary is the task summary cut to 200
+`handoff_seq`, `schema`; keys with no value are omitted. The event summary is the task summary cut to 200
 characters. **`payload.description`, amendment text and result output are never in an event.**
 
 - **A lost event never blocks a queue write.** If the outbox cannot be written, the error is
@@ -568,7 +585,7 @@ This covers `source_agent` on `submit_task` too, which is an identity claim and 
 
 ## Task File Schema
 
-Tasks are YAML files in `~/.claude/task-queue/`, named `YYYYMMDD-HHMMSS-<uuid-prefix>.yml`. Two optional top-level fields were added in v0.14.0: `build_name` and `audit_round` (see `submit_task`). Records without them are unchanged. All writes are atomic (write to `.tmp`, then `os.rename()`). Per-task file locks via `fcntl.flock` prevent races between concurrent MCP calls and the dispatcher.
+Tasks are YAML files in `~/.claude/task-queue/`, named `YYYYMMDD-HHMMSS-<uuid-prefix>.yml`. Two optional top-level fields were added in v0.14.0: `build_name` and `audit_round` (see `submit_task`). A third, `handoff_seq`, was added in v0.16.0 and appears only on `pre_audit` tasks. Records without them are unchanged. All writes are atomic (write to `.tmp`, then `os.rename()`). Per-task file locks via `fcntl.flock` prevent races between concurrent MCP calls and the dispatcher.
 
 For the full schema and lifecycle documentation, see the [homelab-agent component doc](https://github.com/TadMSTR/homelab-agent/blob/main/docs/components/agent/task-queue-mcp.md).
 

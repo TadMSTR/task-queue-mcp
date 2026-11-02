@@ -106,11 +106,16 @@ def submit_task(
     originating_task_id: str | None = None,
     build_name: str | None = None,
     audit_round: int | None = None,
+    handoff_seq: int | None = None,
 ) -> dict:
     """
     Submit a new task to the queue.
     task_type: build | deploy | fix | research | review | audit | notify | docs |
-               ticket_audit | ticket_audit_complete
+               ticket_audit | ticket_audit_complete | pre_audit
+      `pre_audit` is a build's fixer task (shared-build-fixer). It must be addressed to
+      yourself (target_agent == your identity), you must be a build agent (developer,
+      sysadmin, fleet), and it requires build_name, audit_round and handoff_seq. It
+      refuses originating_task_id and requires_approval=True. The dispatcher launches it.
       `notify` is SELF-TERMINAL: the task is written straight to `completed`, no agent is
       ever launched for it and nobody has to close it. Use it for "here is a result,
       nothing to do" — a verdict, an outcome, an FYI. Do NOT use it to ask for work: a
@@ -129,11 +134,14 @@ def submit_task(
       still holds for `notify`: a notification closes the request it answers.
     build_name: optional. The build this task belongs to (letters, digits, '_', '-'; no
       dots or slashes). Build steps and audit rounds are joined on it.
-    audit_round: optional, 1-20, only for task_type audit or ticket_audit. Round 1 is the
-      first audit of a build; a re-check after remediation is round 2, and so on. Don't
+    audit_round: optional, 1-20, only for task_type audit, ticket_audit or pre_audit (where
+      it is required). Round 1 is the first audit of a build; a re-check after
+      remediation is round 2, and so on. Don't
       pass it on a return: a task whose originating_task_id names an audit or
       ticket_audit task with the same build_name inherits that task's round, read from
       the queue.
+    handoff_seq: 0-2, required for task_type pre_audit and refused on every other type.
+      0 is the first fixer session of a round; 1 and 2 are relays.
     source_agent must be your own authenticated identity; you cannot file a task as
       another agent.
     Returns: {ok, task_id, filename} on success, plus auto_closed_task_id when a parent was
@@ -163,6 +171,7 @@ def submit_task(
         queue_dir=QUEUE_DIR,
         build_name=build_name,
         audit_round=audit_round,
+        handoff_seq=handoff_seq,
     )
 
 

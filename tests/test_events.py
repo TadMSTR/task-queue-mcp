@@ -352,6 +352,22 @@ def test_build_name_and_audit_round_are_stored_and_emitted(tmp_path):
     assert (e["metadata"]["build_name"], e["metadata"]["audit_round"]) == ("op-panel-p3_x", 2)
 
 
+def test_pre_audit_handoff_seq_is_stored_and_emitted(tmp_path):
+    """A fixer task's event carries its handoff_seq, and agent-bus's validator accepts it."""
+    _submit(
+        tmp_path,
+        source_agent="developer",
+        target_agent="developer",
+        task_type="pre_audit",
+        build_name="b-1",
+        audit_round=2,
+        handoff_seq=1,
+    )
+    [e] = _events(tmp_path)
+    md = e["metadata"]
+    assert (md["task_type"], md["audit_round"], md["handoff_seq"]) == ("pre_audit", 2, 1)
+
+
 def test_both_fields_are_optional_and_absent_by_default(tmp_path):
     r = _submit(tmp_path)
     data = yaml.safe_load((tmp_path / r["filename"]).read_text())
