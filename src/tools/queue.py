@@ -195,8 +195,11 @@ QUEUE_LOCATION_KEY = "queue_location"
 # in event metadata, and agent-bus caps that.
 _BUILD_NAME_RE = re.compile(r"[a-zA-Z0-9_\-]{1,128}")
 AUDIT_ROUND_MIN = 1
+# task-dispatcher's FIXER_AUDIT_ROUND_MAX must equal this; its
+# tests/test_task_queue_vocabulary.py compares the two against this repo's main.
 AUDIT_ROUND_MAX = 20
-# Only audits have rounds. Allowing the field anywhere would let it mean nothing.
+# The audit types, which may carry or inherit a round. pre_audit is the one other type
+# with a round, and it must carry one (_pre_audit_error); no other type may.
 AUDIT_TASK_TYPES = {"audit", "ticket_audit"}
 
 # `pre_audit` is a fixer task: a build agent queues it to itself after a build, and the
@@ -211,9 +214,13 @@ AUDIT_TASK_TYPES = {"audit", "ticket_audit"}
 # the same uid that reads another agent's token from its .env: every agent except steward
 # runs as ted (agent isolation, vikunja #1193 (id 1276)).
 PRE_AUDIT_TASK_TYPE = "pre_audit"
-# The build agents. Kept in step by hand with task_dispatcher.cli.FIXER_AGENTS.
+# The build agents. task-dispatcher keeps its own FIXER_AGENTS (a separate repo, no shared
+# import); its tests/test_task_queue_vocabulary.py fails CI if the two sets differ.
 FIXER_AGENTS = frozenset({"developer", "sysadmin", "fleet"})
-# The h<k> in the handoff path. 2 = pre-audit-gate.py --max-relays: h0 plus two relays.
+# The h<k> in the handoff path: h0 plus two relays. Three copies must agree: this one,
+# task-dispatcher's FIXER_HANDOFF_SEQ_MAX (compared by that repo's vocabulary test), and
+# host-forge/scripts pre-audit-gate.py's --max-relays default, which is private and is
+# kept by this comment and the matching one there.
 HANDOFF_SEQ_MIN = 0
 HANDOFF_SEQ_MAX = 2
 
