@@ -216,6 +216,10 @@ AUDIT_TASK_TYPES = {"audit", "ticket_audit"}
 PRE_AUDIT_TASK_TYPE = "pre_audit"
 # The build agents. task-dispatcher keeps its own FIXER_AGENTS (a separate repo, no shared
 # import); its tests/test_task_queue_vocabulary.py fails CI if the two sets differ.
+# SECURITY[accepted]: two definitions of one privileged set, not one shared import (HA-22).
+# A drift fails closed both ways: an agent only the dispatcher lists can't get a pre_audit
+# submitted here, and one only listed here is refused by the dispatcher's launcher. Ted,
+# 2026-11-02 (pre-audit, audit-fixer-2026-11-p2-fixer-autolaunch); accepted-risks.md.
 FIXER_AGENTS = frozenset({"developer", "sysadmin", "fleet"})
 # The h<k> in the handoff path: h0 plus two relays. This is the upstream copy, and both
 # others are pinned to it by a CI gate that fetches this file from main and ast-parses
