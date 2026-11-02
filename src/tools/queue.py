@@ -42,6 +42,7 @@ VALID_TASK_TYPES = {
     "docs",
     "ticket_audit",
     "ticket_audit_complete",
+    "pre_audit",
 }
 # `manual-then-auto` gates only its OWN leg: the dispatcher queues it for operator pickup
 # exactly like `semi-auto`, but every task spawned by the resulting session inherits `auto`.
@@ -197,6 +198,24 @@ AUDIT_ROUND_MIN = 1
 AUDIT_ROUND_MAX = 20
 # Only audits have rounds. Allowing the field anywhere would let it mean nothing.
 AUDIT_TASK_TYPES = {"audit", "ticket_audit"}
+
+# `pre_audit` is a fixer task: a build agent queues it to itself after a build, and the
+# dispatcher launches a fresh session of that agent on the handoff file
+# `fixer-handoffs/<build_name>/r<audit_round>-h<handoff_seq>.md`. Every field the
+# dispatcher builds that path from is required and bounded here, and the dispatcher checks
+# them again, because a queue file can be written without going through submit_task.
+#
+# SECURITY: source == target is enforced after `bind_actor`, which ties source_agent to the
+# caller's bearer token, so an agent can queue a fixer of itself only. That holds against
+# mistakes and cross-agent prompt injection. It does not hold against a process running as
+# the same uid that reads another agent's token from its .env: every agent except steward
+# runs as ted (agent isolation, vikunja #1193 (id 1276)).
+PRE_AUDIT_TASK_TYPE = "pre_audit"
+# The build agents. Kept in step by hand with task_dispatcher.cli.FIXER_AGENTS.
+FIXER_AGENTS = frozenset({"developer", "sysadmin", "fleet"})
+# The h<k> in the handoff path. 2 = pre-audit-gate.py --max-relays: h0 plus two relays.
+HANDOFF_SEQ_MIN = 0
+HANDOFF_SEQ_MAX = 2
 
 # context_refs validation: enforce absolute paths (must start with '/').
 # Trust model: we do not restrict to a specific prefix allowlist — consumers
@@ -466,6 +485,50 @@ def _is_valid_audit_round(value) -> bool:
     )
 
 
+def _is_valid_handoff_seq(value) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int)
+        and HANDOFF_SEQ_MIN <= value <= HANDOFF_SEQ_MAX
+    )
+
+
+def _pre_audit_error(
+    source_agent: str,
+    target_agent: str,
+    build_name: str | None,
+    audit_round: int | None,
+    handoff_seq: int | None,
+    originating_task_id: str | None,
+    requires_approval: bool,
+) -> str | None:
+    """Why a `pre_audit` task is refused, or None. Field formats are checked by the caller."""
+    if source_agent != target_agent:
+        return (
+            f"pre_audit must be addressed to its submitter: source_agent {source_agent!r} "
+            f"!= target_agent {target_agent!r}"
+        )
+    if target_agent not in FIXER_AGENTS:
+        return (
+            f"pre_audit target_agent must be a build agent {sorted(FIXER_AGENTS)}, "
+            f"not {target_agent!r}"
+        )
+    if build_name is None:
+        return "pre_audit requires build_name"
+    if audit_round is None:
+        return "pre_audit requires audit_round"
+    if handoff_seq is None:
+        return "pre_audit requires handoff_seq"
+    # A fixer is not a return. With a parent, the submit-time auto-close and the round
+    # ledger's return matching would both read it as one.
+    if originating_task_id is not None:
+        return "pre_audit must not carry originating_task_id"
+    # An approval gate on a self-addressed fixer is a stall, not a control.
+    if requires_approval:
+        return "pre_audit must not set requires_approval"
+    return None
+
+
 def _inherited_audit_round(
     queue_dir: str,
     originating_task_id: str,
@@ -532,6 +595,7 @@ def submit_task_handler(
     queue_dir: str | None = None,
     build_name: str | None = None,
     audit_round: int | None = None,
+    handoff_seq: int | None = None,
 ) -> dict:
     if context_refs is None:
         context_refs = []
@@ -612,14 +676,40 @@ def submit_task_handler(
                     f"{AUDIT_ROUND_MIN} to {AUDIT_ROUND_MAX}"
                 ),
             }
-        if task_type not in AUDIT_TASK_TYPES:
+        if task_type not in AUDIT_TASK_TYPES and task_type != PRE_AUDIT_TASK_TYPE:
             return {
                 "ok": False,
                 "error": (
-                    f"audit_round is only valid for task_type {sorted(AUDIT_TASK_TYPES)}, "
-                    f"not {task_type!r}"
+                    f"audit_round is only valid for task_type "
+                    f"{sorted(AUDIT_TASK_TYPES | {PRE_AUDIT_TASK_TYPE})}, not {task_type!r}"
                 ),
             }
+    if handoff_seq is not None:
+        if not _is_valid_handoff_seq(handoff_seq):
+            return {
+                "ok": False,
+                "error": (
+                    f"Invalid handoff_seq: {handoff_seq!r} — an integer from "
+                    f"{HANDOFF_SEQ_MIN} to {HANDOFF_SEQ_MAX}"
+                ),
+            }
+        if task_type != PRE_AUDIT_TASK_TYPE:
+            return {
+                "ok": False,
+                "error": f"handoff_seq is only valid for task_type 'pre_audit', not {task_type!r}",
+            }
+    if task_type == PRE_AUDIT_TASK_TYPE:
+        err = _pre_audit_error(
+            source_agent,
+            target_agent,
+            build_name,
+            audit_round,
+            handoff_seq,
+            originating_task_id,
+            requires_approval,
+        )
+        if err:
+            return {"ok": False, "error": err}
 
     # A security return is task_type `build`, so it can never carry a round of its own. It
     # inherits one from the audit it answers. Read from the queue, never from the caller.
@@ -709,6 +799,8 @@ def submit_task_handler(
         task["build_name"] = build_name
     if audit_round is not None:
         task["audit_round"] = audit_round
+    if handoff_seq is not None:
+        task["handoff_seq"] = handoff_seq
 
     _write_task_atomic(path, task)
 
