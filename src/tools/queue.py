@@ -217,10 +217,11 @@ PRE_AUDIT_TASK_TYPE = "pre_audit"
 # The build agents. task-dispatcher keeps its own FIXER_AGENTS (a separate repo, no shared
 # import); its tests/test_task_queue_vocabulary.py fails CI if the two sets differ.
 FIXER_AGENTS = frozenset({"developer", "sysadmin", "fleet"})
-# The h<k> in the handoff path: h0 plus two relays. Three copies must agree: this one,
-# task-dispatcher's FIXER_HANDOFF_SEQ_MAX (compared by that repo's vocabulary test), and
-# host-forge/scripts pre-audit-gate.py's --max-relays default, which is private and is
-# kept by this comment and the matching one there.
+# The h<k> in the handoff path: h0 plus two relays. This is the upstream copy, and both
+# others are pinned to it by a CI gate that fetches this file from main and ast-parses
+# this literal: task-dispatcher's FIXER_HANDOFF_SEQ_MAX (tests/test_task_queue_vocabulary.py)
+# and host-forge/scripts pre-audit-gate.py's MAX_RELAYS_DEFAULT, the --max-relays default
+# (scripts/tests/test_handoff_seq_parity.py). Keep it a plain int literal, or both fail.
 HANDOFF_SEQ_MIN = 0
 HANDOFF_SEQ_MAX = 2
 
