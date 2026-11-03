@@ -195,8 +195,11 @@ QUEUE_LOCATION_KEY = "queue_location"
 # in event metadata, and agent-bus caps that.
 _BUILD_NAME_RE = re.compile(r"[a-zA-Z0-9_\-]{1,128}")
 AUDIT_ROUND_MIN = 1
+# task-dispatcher's FIXER_AUDIT_ROUND_MAX must equal this; its
+# tests/test_task_queue_vocabulary.py compares the two against this repo's main.
 AUDIT_ROUND_MAX = 20
-# Only audits have rounds. Allowing the field anywhere would let it mean nothing.
+# The audit types, which may carry or inherit a round. pre_audit is the one other type
+# with a round, and it must carry one (_pre_audit_error); no other type may.
 AUDIT_TASK_TYPES = {"audit", "ticket_audit"}
 
 # `pre_audit` is a fixer task: a build agent queues it to itself after a build, and the
@@ -211,9 +214,18 @@ AUDIT_TASK_TYPES = {"audit", "ticket_audit"}
 # the same uid that reads another agent's token from its .env: every agent except steward
 # runs as ted (agent isolation, vikunja #1193 (id 1276)).
 PRE_AUDIT_TASK_TYPE = "pre_audit"
-# The build agents. Kept in step by hand with task_dispatcher.cli.FIXER_AGENTS.
+# The build agents. task-dispatcher keeps its own FIXER_AGENTS (a separate repo, no shared
+# import); its tests/test_task_queue_vocabulary.py fails CI if the two sets differ.
+# SECURITY[accepted]: two definitions of one privileged set, not one shared import (HA-22).
+# A drift fails closed both ways: an agent only the dispatcher lists can't get a pre_audit
+# submitted here, and one only listed here is refused by the dispatcher's launcher. Ted,
+# 2026-11-02 (pre-audit, audit-fixer-2026-11-p2-fixer-autolaunch); accepted-risks.md.
 FIXER_AGENTS = frozenset({"developer", "sysadmin", "fleet"})
-# The h<k> in the handoff path. 2 = pre-audit-gate.py --max-relays: h0 plus two relays.
+# The h<k> in the handoff path: h0 plus two relays. This is the upstream copy, and both
+# others are pinned to it by a CI gate that fetches this file from main and ast-parses
+# this literal: task-dispatcher's FIXER_HANDOFF_SEQ_MAX (tests/test_task_queue_vocabulary.py)
+# and host-forge/scripts pre-audit-gate.py's MAX_RELAYS_DEFAULT, the --max-relays default
+# (scripts/tests/test_handoff_seq_parity.py). Keep it a plain int literal, or both fail.
 HANDOFF_SEQ_MIN = 0
 HANDOFF_SEQ_MAX = 2
 
